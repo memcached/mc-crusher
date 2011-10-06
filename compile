@@ -1,0 +1,4 @@
+#!/bin/bash
+# I violate the laws of reason.
+rm -f mc-crusher
+gcc -g -O2 -o mc-crusher -levent ./mc-crusher.c

@@ -1,0 +1,667 @@
+/* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
+/*
+ *  mc-crusher - make the rabbit fear you
+ *
+ *       https://github.com/dormando/mc-crusher
+ *
+ *  Copyright 2011 Dormando.  All rights reserved.
+ *
+ *  Use and distribution licensed under the BSD license.  See
+ *  the LICENSE file for full text.
+ *
+ *  Authors:
+ *      dormando <dormando@rydia.net>
+ */
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <event.h>
+#include <netdb.h>
+#include <pthread.h>
+#include <unistd.h>
+
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <assert.h>
+#include <limits.h>
+#include <sysexits.h>
+#include <stddef.h>
+#include <sys/stat.h>
+
+#include "protocol_binary.h"
+
+uint64_t counter;
+uint64_t reset_counter_after;
+unsigned char *shared_value;
+
+enum conn_states {
+    conn_connecting = 0,
+    conn_sending,
+    conn_reading,
+};
+
+struct mc_key {
+    unsigned char *key;
+    size_t key_len;
+};
+
+struct connection {
+    /* Event stuff */
+    int fd;
+    struct event ev;
+    enum conn_states state;
+    short ev_flags;
+
+    /* Counters, bits, flags for individual senders/getters .
+     * This isn't a union because who gives a shit.
+     */
+    int mget_count;                /* # of ascii mget keys to send at once */
+    unsigned char key_prefix[240];
+    int value_size;
+    unsigned char value[2048];     /* manually specified seed value */
+    int buf_written;
+    int buf_towrite;
+
+    /* Binprot headers */
+    protocol_binary_request_get bin_get_pkt;
+    protocol_binary_request_set bin_set_pkt;
+
+    /* Buffers and writer/reader pointers */
+    struct mc_key *keys;
+    unsigned char wbuf[65536];
+    unsigned char rbuf[4096];
+    void (*writer)(void *arg);
+    void (*reader)(void *arg);
+};
+
+static struct event_base *main_base;
+
+static void client_handler(const int fd, const short which, void *arg);
+
+static int update_conn_event(struct connection *c, const int new_flags)
+{
+    if (c->ev_flags == new_flags) return 1;
+    if (event_del(&c->ev) == -1) return 0;
+
+    c->ev_flags = new_flags;
+    event_set(&c->ev, c->fd, new_flags, client_handler, (void *)c);
+    event_base_set(main_base, &c->ev);
+
+    if (event_add(&c->ev, 0) == -1) return 0;
+    return 1;
+}
+
+static void write_bin_get_to_client(void *arg) {
+    struct connection *c = arg;
+    int wbytes = 0;
+    uint32_t keylen = 0;
+
+    keylen = sprintf(c->wbuf + sizeof(c->bin_get_pkt), "%s%llu", c->key_prefix,
+        (unsigned long long)counter++);
+    c->bin_get_pkt.message.header.request.keylen = htons(keylen);
+    c->bin_get_pkt.message.header.request.bodylen = htonl(keylen);
+    memcpy(c->wbuf, (char *)&c->bin_get_pkt.bytes, sizeof(c->bin_get_pkt));
+    wbytes = send(c->fd, c->wbuf, sizeof(c->bin_get_pkt) + keylen, 0);
+    c->state = conn_reading;
+    if (counter > reset_counter_after) {
+        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
+        counter = 0;
+    }
+}
+
+static void write_bin_getq_to_client(void *arg) {
+    struct connection *c = arg;
+    int wbytes = 0;
+    uint32_t keylen = 0;
+    int towrite = 0;
+    size_t psize = sizeof(c->bin_get_pkt);
+
+    /* existing buffer we need to finish flushing */
+    if (c->buf_towrite) {
+        wbytes = send(c->fd, c->wbuf + c->buf_written, c->buf_towrite, 0);
+        if (wbytes == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                c->state = conn_reading;
+                return;
+            } else {
+                perror("Early write error to client");
+                return;
+            }
+        } else if (wbytes < c->buf_towrite) {
+            c->state = conn_reading;
+            c->buf_towrite -= wbytes;
+            c->buf_written += wbytes;
+            return;
+        }
+        c->buf_towrite = 0;
+        c->buf_written = 0;
+    }
+
+    for(;;) {
+        towrite = 0;
+        while (towrite < (4096 - (psize + 250))) {
+            keylen = sprintf(c->wbuf + towrite + psize, "%s%llu",
+                c->key_prefix, (unsigned long long)counter++);
+            c->bin_get_pkt.message.header.request.keylen = htons(keylen);
+            c->bin_get_pkt.message.header.request.bodylen = htonl(keylen);
+            memcpy(c->wbuf + towrite, (char *)&c->bin_get_pkt.bytes, psize);
+            towrite += keylen + psize;
+            if (counter > reset_counter_after) {
+                fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
+                counter = 0;
+            }
+
+        }
+        wbytes = send(c->fd, c->wbuf, towrite, 0);
+        if (wbytes == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                c->state = conn_reading;
+                c->buf_towrite = towrite;
+                return;
+            } else {
+                perror("Late write error to client");
+                return;
+            }
+        } else if (wbytes < towrite) {
+            c->state = conn_reading;
+            c->buf_towrite = towrite - wbytes;
+            c->buf_written = wbytes;
+            return;
+        }
+    }
+
+    return;
+}
+
+static void write_bin_set_to_client(void *arg) {
+    struct connection *c = arg;
+    int wbytes = 0;
+    uint32_t keylen = 0;
+
+    keylen = sprintf(c->wbuf + sizeof(c->bin_set_pkt), "%s%llu", c->key_prefix,
+        (unsigned long long)counter++);
+    c->bin_set_pkt.message.header.request.keylen = htons(keylen);
+    c->bin_set_pkt.message.header.request.bodylen = htonl(keylen +
+        c->value_size + 8);
+    memcpy(c->wbuf, (char *)&c->bin_set_pkt.bytes, sizeof(c->bin_set_pkt));
+    wbytes = send(c->fd, c->wbuf, sizeof(c->bin_set_pkt) + keylen, 0);
+    if (c->value[0] == '\0') {
+        wbytes = send(c->fd, shared_value, c->value_size, 0);
+    } else {
+        wbytes = send(c->fd, c->value, c->value_size, 0);
+    }
+
+    c->state = conn_reading;
+    if (counter > reset_counter_after) {
+        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
+        counter = 0;
+    }
+
+    return;
+}
+
+static void write_bin_setq_to_client(void *arg) {
+    struct connection *c = arg;
+    int wbytes = 0;
+    uint32_t keylen = 0;
+    int towrite = 0;
+    size_t psize = sizeof(c->bin_set_pkt);
+
+    update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
+    /* existing buffer we need to finish flushing */
+    if (c->buf_towrite) {
+        wbytes = send(c->fd, c->wbuf + c->buf_written, c->buf_towrite, 0);
+        if (wbytes == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                c->state = conn_sending;
+                return;
+            } else {
+                perror("Early write error to client");
+                return;
+            }
+        } else if (wbytes < c->buf_towrite) {
+            c->state = conn_reading;
+            c->buf_towrite -= wbytes;
+            c->buf_written += wbytes;
+            return;
+        }
+        c->buf_towrite = 0;
+        c->buf_written = 0;
+    }
+
+    for(;;) {
+        towrite = 0;
+        while (towrite < (4096 - (psize + 250))) {
+            keylen = sprintf(c->wbuf + towrite + psize, "%s%llu",
+                c->key_prefix, (unsigned long long)counter++);
+            c->bin_set_pkt.message.header.request.keylen = htons(keylen);
+            c->bin_set_pkt.message.header.request.bodylen = htonl(keylen + 8 +
+                c->value_size);
+            memcpy(c->wbuf + towrite, (char *)&c->bin_set_pkt.bytes, psize);
+            towrite += keylen + psize;
+            if (c->value[0] == '\0') {
+                memcpy(c->wbuf + towrite, shared_value, c->value_size);
+            } else {
+                memcpy(c->wbuf + towrite, c->value, c->value_size);
+            }
+            towrite += c->value_size;
+
+            if (counter > reset_counter_after) {
+                fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
+                counter = 0;
+            }
+
+        }
+        wbytes = send(c->fd, c->wbuf, towrite, 0);
+        if (wbytes == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                c->state = conn_sending;
+                c->buf_towrite = towrite;
+                return;
+            } else {
+                perror("Late write error to client");
+                return;
+            }
+        } else if (wbytes < towrite) {
+            c->state = conn_sending;
+            c->buf_towrite = towrite - wbytes;
+            c->buf_written = wbytes;
+            return;
+        }
+    }
+
+    return;
+}
+
+static void write_ascii_mget_to_client(void *arg) {
+    struct connection *c = arg;
+    int wbytes = 0;
+    int written = 0;
+    int i;
+    strcpy(c->wbuf, "get ");
+    written += 4;
+    for (i = 0; i < c->mget_count; i++) {
+        written += sprintf(c->wbuf + written, "%s%llu ",
+            c->key_prefix, (unsigned long long)counter++);
+    }
+    strcpy(c->wbuf + (written), "\r\n");
+    wbytes = send(c->fd, &c->wbuf, written + 2, 0);
+    c->state = conn_reading;
+    if (counter > reset_counter_after) {
+        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
+        counter = 0;
+    }
+}
+
+static void write_ascii_get_to_client(void *arg) {
+    struct connection *c = arg;
+    int wbytes = 0;
+    sprintf(c->wbuf, "get %s%llu\r\n", c->key_prefix,
+        (unsigned long long)counter++);
+    wbytes = send(c->fd, &c->wbuf, strlen(c->wbuf), 0);
+    c->state = conn_reading;
+    if (counter > reset_counter_after) {
+        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
+        counter = 0;
+    }
+}
+
+/* Example of how to rewrite these functions.
+   This *greatly* reduces the user cpu time, however the bench spends almost
+   all of its time in the syscalls already.
+   So I'm not prioritizing this change right now.
+ */
+static void future_write_ascii_get_to_client(void *arg) {
+    struct connection *c = arg;
+    int wbytes = 0;
+    struct iovec vecs[3];
+    vecs[0].iov_base = "get ";
+    vecs[0].iov_len = 4;
+    vecs[1].iov_base = c->keys[counter].key;
+    vecs[1].iov_len  = c->keys[counter].key_len;
+    vecs[2].iov_base = "\r\n";
+    vecs[2].iov_len = 2;
+    
+    wbytes = writev(c->fd, vecs, 3);
+    c->state = conn_reading;
+    if (counter > reset_counter_after) {
+        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
+        counter = 0;
+    }
+}
+
+static void write_ascii_set_to_client(void *arg) {
+    struct connection *c = arg;
+    int wbytes = 0;
+    int towrite = 0;
+    towrite = sprintf(c->wbuf, "set %s%llu 0 0 %d\r\n", c->key_prefix,
+        (unsigned long long)counter++, c->value_size);
+    wbytes = send(c->fd, &c->wbuf, towrite, 0);
+    if (c->value[0] == '\0') {
+        wbytes = send(c->fd, shared_value, c->value_size, 0);
+    } else {
+        wbytes = send(c->fd, c->value, c->value_size, 0);
+    }
+    wbytes = send(c->fd, "\r\n", 2, 0);
+    c->state = conn_reading;
+    if (counter > reset_counter_after) {
+        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
+        counter = 0;
+    }
+}
+
+static void read_from_client(void *arg) {
+    struct connection *c = arg;
+    int rbytes = 0;
+    for (;;) {
+        rbytes = read(c->fd, &c->rbuf, 4096);
+        if (rbytes == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else {
+                perror("Read error from client");
+            }
+        }
+        if (rbytes < 4095)
+            break; /* don't call read() again unless we may get data */
+    }
+    c->writer(c);
+}
+
+static void client_handler(const int fd, const short which, void *arg) {
+    struct connection *c = (struct connection *)arg;
+    int err = 0;
+    socklen_t errsize = sizeof(err);
+
+    switch (c->state) {
+    case conn_connecting:
+        if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &errsize) < 0) {
+            return;
+        }
+        if (err != 0) {
+            return;
+        }
+        c->state = conn_sending;
+        update_conn_event(c, EV_READ | EV_PERSIST);
+    case conn_sending:
+        c->writer(c);
+        break;
+    case conn_reading:
+        c->reader(c);
+        break;
+    }
+}
+
+static int new_connection(struct connection *t)
+{
+    int sock;
+    struct sockaddr_in dest_addr;
+    int flags = 1;
+    const char *ip_addr = "127.0.0.1";
+    int port_num = 11211;
+    struct connection *c = (struct connection *)malloc(sizeof(struct connection));
+    memcpy(c, t, sizeof(struct connection));
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(port_num);
+    dest_addr.sin_addr.s_addr = inet_addr(ip_addr);
+
+    if ( (flags = fcntl(sock, F_GETFL, 0)) < 0 ||
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    memset(&(dest_addr.sin_zero), '\0', 8);
+
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
+
+    if (connect(sock, (const struct sockaddr *)&dest_addr, sizeof(dest_addr)) == -1) {
+        if (errno != EINPROGRESS) {
+            close(sock);
+            return -1;
+        }
+    }
+
+    c->fd = sock;
+    c->state = conn_connecting;
+    c->ev_flags = EV_WRITE;
+
+    event_set(&c->ev, sock, c->ev_flags, client_handler, (void *)c);
+    event_base_set(main_base, &c->ev);
+    event_add(&c->ev, NULL);
+
+    return sock;
+}
+
+static void init_bin_get(struct connection *t) {
+    t->bin_get_pkt.message.header.request.magic = PROTOCOL_BINARY_REQ;
+    t->bin_get_pkt.message.header.request.opcode = PROTOCOL_BINARY_CMD_GET;
+    t->bin_get_pkt.message.header.request.keylen = 0; /* init to zero */
+    t->bin_get_pkt.message.header.request.extlen = 0; /* no extras for gets */
+    t->bin_get_pkt.message.header.request.bodylen = 0; /* init to zero */
+    t->bin_get_pkt.message.header.request.opaque = 0; /* who cares */
+    t->bin_get_pkt.message.header.request.cas = 0; /* also who cares */
+}
+
+static void init_bin_getq(struct connection *t) {
+    /* lulz */
+    init_bin_get(t);
+    t->bin_get_pkt.message.header.request.opcode = PROTOCOL_BINARY_CMD_GETQ;
+}
+
+static void init_bin_set(struct connection *t) {
+    t->bin_set_pkt.message.header.request.magic = PROTOCOL_BINARY_REQ;
+    t->bin_set_pkt.message.header.request.opcode = PROTOCOL_BINARY_CMD_SET;
+    t->bin_set_pkt.message.header.request.keylen = 0; /* init to zero */
+    t->bin_set_pkt.message.header.request.extlen = 8; /* flags + exptime */
+    t->bin_set_pkt.message.header.request.bodylen = 0; /* init to zero */
+    t->bin_set_pkt.message.header.request.opaque = 0; /* who cares */
+    t->bin_set_pkt.message.header.request.cas = 0; /* also who cares */
+
+    t->bin_set_pkt.message.body.flags = 0;
+    t->bin_set_pkt.message.body.expiration = 0; /* this will be an option */
+}
+
+static void init_bin_setq(struct connection *t) {
+    init_bin_set(t);
+    t->bin_set_pkt.message.header.request.opcode = PROTOCOL_BINARY_CMD_SETQ;
+}
+
+static void prealloc_keys(struct connection *t) {
+    /* This "leaks" the blob on purpose. Also temporary hardcoded rough key
+     * length is used. 
+     */
+    unsigned char *key_blob;
+    unsigned char *key_blob_ptr;
+    struct mc_key *keys;
+    int i;
+    int len = 0;
+
+    key_blob = calloc(reset_counter_after + 10000, 30);
+    keys     = calloc(reset_counter_after + 10000, sizeof(struct mc_key));
+    if (key_blob == NULL || keys == NULL) {
+        perror("Mallocing key prealloc");
+        exit(1);
+    }
+    key_blob_ptr = key_blob;
+    fprintf(stdout, "Prealloc memory: %llu + %llu\n", (unsigned long long)(reset_counter_after +
+        10000) * 30, (unsigned long long)sizeof(struct mc_key) * (reset_counter_after + 10000));
+
+    counter = 0;
+    for (i = 0; i < reset_counter_after + 10000; i++) {
+        len = sprintf(key_blob_ptr, "%s%llu", t->key_prefix,
+            (unsigned long long)counter++);
+        keys[i].key     = key_blob_ptr;
+        keys[i].key_len = len;
+        key_blob_ptr   += len;
+    }
+    counter = 0;
+
+    t->keys = keys;
+}
+
+/* Get a little verbose to avoid a big if/else if tree */
+static void parse_config_line(char *line) {
+    char *in_progress, *token;
+    struct connection template;
+    int conns_tomake = 1;
+    int newsock;
+    int i;
+    char *tmp;
+
+    enum {
+        SEND = 0,
+        RECV,
+        TIME,
+        USLEEP,
+        COUNT,
+        CONNS,
+        SLEEP_EVERY,
+        EXPIRE,
+        KEY_PREFIX,
+        KEY_LEN,
+        KEY_GENERATE,
+        VALUE_SIZE,
+        VALUE_RANGE,
+        VALUE_RANGE_STEP,
+        MGET_COUNT,
+        VALUE,
+    };
+
+    char *const key_options[] = {
+        [SEND]             = "send",
+        [RECV]             = "recv",
+        [TIME]             = "time",
+        [USLEEP]           = "usleep",
+        [COUNT]            = "count",
+        [CONNS]            = "conns",
+        [SLEEP_EVERY]      = "sleep_every",
+        [EXPIRE]           = "expire",
+        [KEY_PREFIX]       = "key_prefix",
+        [KEY_LEN]          = "key_len",
+        [KEY_GENERATE]     = "key_generate",
+        [VALUE_SIZE]       = "value_size",
+        [VALUE_RANGE]      = "value_range",
+        [VALUE_RANGE_STEP] = "value_range_step",
+        [MGET_COUNT]       = "mget_count",
+        [VALUE]            = "value",
+        NULL
+    };
+
+    memset(&template, 0, sizeof(struct connection));
+    /* Set defaults into template */
+    strcpy(template.key_prefix, "foo");
+    template.mget_count = 2;
+    template.value_size = 2;
+    template.value[0] = '\0';
+    template.buf_written = 0;
+
+    /* Chomp the ending newline */
+    tmp = rindex(line, '\n');
+    if (tmp != NULL) 
+        *tmp = '\0';
+    while ((token = strtok_r(line, ",", &in_progress)) != NULL) {
+        int key = 0;
+        char *value = NULL;
+        value = index(token, '=');
+        *value = '\0';
+        value++;
+        
+        line = NULL; /* lazy */
+        while (key_options[key] != NULL) {
+            if (strcmp(token, key_options[key]) == 0)
+                break;
+            key++;
+        }
+        fprintf(stderr, "id %d for key %s value %s\n", key, token, value);
+
+        switch (key) {
+        case SEND:
+            if (strcmp(value, "ascii_set") == 0) {
+                template.writer = write_ascii_set_to_client;
+            } else if (strcmp(value, "ascii_get") == 0) {
+                template.writer = write_ascii_get_to_client;
+            } else if (strcmp(value, "ascii_mget") == 0) {
+                template.writer = write_ascii_mget_to_client;
+            } else if (strcmp(value, "bin_get") == 0) {
+                init_bin_get(&template);
+                template.writer = write_bin_get_to_client;
+            } else if (strcmp(value, "bin_getq") == 0) {
+                init_bin_getq(&template);
+                template.writer = write_bin_getq_to_client;
+            } else if (strcmp(value, "bin_set") == 0) {
+                init_bin_set(&template);
+                template.writer = write_bin_set_to_client;
+            } else if (strcmp(value, "bin_setq") == 0) {
+                init_bin_setq(&template);
+                template.writer = write_bin_setq_to_client;
+            }
+            break;
+        case RECV:
+            template.reader = read_from_client;
+            break;
+        case CONNS:
+            conns_tomake = atoi(value);
+            break;
+        case COUNT:
+            break;
+        case KEY_PREFIX:
+            strcpy(template.key_prefix, value);
+            break;
+        case MGET_COUNT:
+            template.mget_count = atoi(value);
+            break;
+        case VALUE_SIZE:
+            template.value_size = atoi(value);
+            break;
+        case VALUE:
+            strcpy(template.value, value);
+            template.value_size = strlen(value);
+            break;
+        }
+    }
+
+    /* use in the future.
+    prealloc_keys(&template);
+    */
+
+    for (i = 0; i < conns_tomake; i++) {
+        newsock = new_connection(&template);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    FILE *cfd;
+    char line[4096];
+    counter = 1;
+    reset_counter_after = 200000;
+
+    shared_value = calloc(1024 * 1024, sizeof(unsigned char));
+
+    main_base = event_init();
+
+    cfd = fopen(argv[1], "r");
+    if (cfd == NULL) {
+        perror("Opening config file");
+        exit(1);
+    }
+
+    while (fgets(line, 4096, cfd) != NULL) {
+        parse_config_line(line);
+    }
+
+    event_base_loop(main_base, 0);
+}

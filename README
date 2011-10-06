@@ -1,0 +1,124 @@
+An extremely rough but extremely damaging benchmark utility for memcached.
+
+Does not use a client library, does not use threads (though it will). Uses
+event based sockets via libevent.
+
+Building
+--------
+
+$ (install libevent + headers)
+$ ./compile
+
+Usage
+-----
+
+Look in the conf/ directory for example configuration files.
+
+$ ./mc-crusher ./conf/loadconf
+
+Running
+-------
+
+This guy is extremely rough. It has hardcoded values such as a 200,000 item
+iteration loop. I'm releasing it early for shiggles.
+
+First, run it for a few seconds with a config like "conf/loadconf", this will
+seed the instance with some values to fetch later. Now, kill it.
+
+Pick a config file, and start it as above. You should start a fresh memcached,
+and run the "sample" script that comes with mc-crusher. mc-crusher makes no
+attempt to care about what it does. It flails tiredlessly against the fanged
+defenses of the cache daemon.
+
+Modify bench-sample to print what you are most interested in examining. Start
+multiple instances of mc-crusher if you think memcached can take more. In the
+future threads will be used for user convenience.
+
+Configuration
+-------------
+
+mc-crusher reads a configuration file then executes. These configurations
+describe a "type" of connection, one per line.
+
+Each "type" can spawn N connections. This allows you to mix setters and
+getters, getters of different sizes, binprot + asciiprot. It's very limited
+right now, but I wanted to build this in as a base.
+
+Config Options
+--------------
+
+send : defines what function to use to send requests to memcached
+ - ascii_get : one get per request via asciiprot
+ - ascii_set : one set per request via asciiprot
+ - ascii_mget : multiget test via asciiprot
+ - bin_get : one get per req via binprot
+ - bin_getq : endless streaming multiget from hell
+ - bin_set : one set per req via binprot
+ - bin_setq : unleash cthulu upon the cache_lock
+
+recv : same, but for received data
+ - blind_recv : mindlessly slurp any responses without inspecting them
+
+mget_count : set this to the number of keys to fetch per get in ascii_mget
+
+key_prefix : a string to prefix before each key's number (default 'foo')
+
+value_size : size of the value to set
+
+value : define a value by hand. Must be shortish and a string.
+
+Caveats
+-------
+
+- I bundled the protocol_binary.h header because I'm an asshole, deal with it.
+
+- Hardcoded to hit a localhost instance. Just recompile if you want it
+elsehwere.
+
+- Does not make any attempt to safely parse the config file. If you don't type
+  it exactly right you will end up with bizarre failures.
+
+- It is missing many features I intend to add and use; however as is it was
+  able to verify some lock scaling patches I worked on.
+
+- It mindlessly iterates through 200,000 keys.
+
+- It only works well with small values
+
+- It makes no attempt to reconcile with errors in the protocol, and can break
+  if memcached throws errors. It will also stop if the connections are closed.
+
+- It's a ton of fun!
+
+Future Features
+---------------
+
+A short list of things I intend to change or add:
+
+- Fix the command generators to have a *little* error handling
+
+- Switch to writev and use iovectors + pregenerated keys for almost everything
+
+- Add back some routines which are sprintf only, for doing tests with
+  extremely wide keyspaces where performance is less of an issue.
+
+- Add a "run_every" option which fires a conn every N microseconds instead of
+  endlessly.
+
+- Add a "timer" option which times the commands it runs and periodically dumps
+  a histogram of response times. Mainly to be used with "run_every"
+
+- Add missing protocol commands. *_incr, *_decr, *_delete, etc.
+
+- Make the iteration loop per-connection, and randomizeable.
+
+- Add commands to iterate over different value sizes
+
+- Add multithreading to ease management.
+
+- Allow running timer conns in their own thread (or just define if a conn
+  template should use a thread, then define conns=1?)
+
+- Bundle a better perl util for printing stats
+
+- Write/bundle a better util for running iterative benchmarks.

@@ -1,0 +1,61 @@
+#!/usr/bin/perl
+# public domain
+# benchmark sampler by dormando.
+# It says "redis" in a few places because I wrote this for that redis v.
+# memcached benchmark and I've decided to write thi scomment instead of edit
+# the code right now.
+
+use warnings;
+use strict;
+use IO::Socket::INET;
+use Time::HiRes;
+
+my $type        = $ARGV[0];
+my $SAMPLE_TIME = $ARGV[1] || 2;
+
+my $addr = $type eq 'redis' ? "127.0.0.1:6379" : "127.0.0.1:11211";
+my $s = connect_to($addr);
+die $@ unless $s;
+
+my $one      = $type eq 'redis' ? redis_info($s) : mc_info($s);
+my $one_time = Time::HiRes::time;
+
+sleep $SAMPLE_TIME;
+
+my $two      = $type eq 'redis' ? redis_info($s) : mc_info($s);
+my $two_time = Time::HiRes::time;
+
+my $elapsed = $two_time - $one_time;
+my $per_sec = ($two - $one) / $elapsed;
+print "$type per-second average ($SAMPLE_TIME): $per_sec\n";
+
+sub redis_info {
+    my $s = shift;
+    print $s "info\r\n";
+    while (my $line = <$s>) {
+        if ($line =~ m/total_commands_processed:(\d+)/) {
+            return $1;
+        }
+    }
+}
+
+sub mc_info {
+    my $s = shift;
+    print $s "stats\r\n";
+    my $get = -1;
+    my $set = -1;
+    while (my $line = <$s>) {
+        last if $line =~ m/^END/;
+        if ($line =~ m/^STAT cmd_get (\d+)/) {
+            $get = $1;
+        } elsif ($line =~ m/STAT cmd_set (\d+)/) {
+            $set = $1;
+        }
+    }
+    # Just comparing the combined stats...
+    return $get + $set;
+}
+
+sub connect_to {
+    return IO::Socket::INET->new(PeerAddr => $_[0], Timeout => 3);
+}

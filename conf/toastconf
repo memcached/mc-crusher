@@ -1,0 +1,2 @@
+send=ascii_mget,recv=blind_read,conns=50,mget_count=5,key_prefix=foobar
+send=ascii_set,recv=blind_read,conns=1,key_prefix=foobar,value_size=2
