@@ -76,6 +76,9 @@ struct connection {
     protocol_binary_request_set bin_set_pkt;
 
     /* Buffers and writer/reader pointers */
+    uint64_t key_count;
+    uint64_t key_randomize;
+    uint64_t cur_key;
     struct mc_key *keys;
     unsigned char wbuf[65536];
     unsigned char rbuf[4096];
@@ -326,16 +329,16 @@ static void future_write_ascii_get_to_client(void *arg) {
     struct iovec vecs[3];
     vecs[0].iov_base = "get ";
     vecs[0].iov_len = 4;
-    vecs[1].iov_base = c->keys[counter].key;
-    vecs[1].iov_len  = c->keys[counter].key_len;
+    vecs[1].iov_base = c->keys[c->cur_key].key;
+    vecs[1].iov_len  = c->keys[c->cur_key].key_len;
     vecs[2].iov_base = "\r\n";
     vecs[2].iov_len = 2;
     
     wbytes = writev(c->fd, vecs, 3);
     c->state = conn_reading;
-    if (counter > reset_counter_after) {
-        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
-        counter = 0;
+    if (c->cur_key++ >= c->key_count) {
+        fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
+        c->cur_key = 0;
     }
 }
 
@@ -442,6 +445,10 @@ static int new_connection(struct connection *t)
     event_base_set(main_base, &c->ev);
     event_add(&c->ev, NULL);
 
+    if (c->key_randomize) {
+        c->cur_key = random() % c->key_count;
+    }
+
     return sock;
 }
 
@@ -486,30 +493,55 @@ static void prealloc_keys(struct connection *t) {
     unsigned char *key_blob;
     unsigned char *key_blob_ptr;
     struct mc_key *keys;
-    int i;
+    struct mc_key temp;
+    uint64_t i;
+    int x;
     int len = 0;
+    long int rand_one;
+    long int rand_two;
 
-    key_blob = calloc(reset_counter_after + 10000, 30);
-    keys     = calloc(reset_counter_after + 10000, sizeof(struct mc_key));
+    /* Generate the blobs and key list */
+    key_blob = calloc(t->key_count, 30);
+    keys     = calloc(t->key_count, sizeof(struct mc_key));
     if (key_blob == NULL || keys == NULL) {
         perror("Mallocing key prealloc");
         exit(1);
     }
     key_blob_ptr = key_blob;
-    fprintf(stdout, "Prealloc memory: %llu + %llu\n", (unsigned long long)(reset_counter_after +
-        10000) * 30, (unsigned long long)sizeof(struct mc_key) * (reset_counter_after + 10000));
+    fprintf(stdout, "Prealloc memory: %llu + %llu\n", (unsigned long long)(t->key_count) * 30,
+        (unsigned long long)sizeof(struct mc_key) * (t->key_count));
 
-    counter = 0;
-    for (i = 0; i < reset_counter_after + 10000; i++) {
+    for (i = 0; i < t->key_count; i++) {
         len = sprintf(key_blob_ptr, "%s%llu", t->key_prefix,
-            (unsigned long long)counter++);
+            (unsigned long long)i);
         keys[i].key     = key_blob_ptr;
         keys[i].key_len = len;
         key_blob_ptr   += len;
     }
-    counter = 0;
 
     t->keys = keys;
+
+    /* Cool, now shuffle the key list if we need to */
+    if (t->key_randomize == 0)
+        return;
+
+    /* TODO: Allow specifying the random seed */
+    srandom(time(NULL));
+
+    /* Run through the list once and shuffle */
+    for (x = 0; x < 4; x++) {
+    for (i = 0; i < t->key_count; i++) {
+        rand_one = random() % t->key_count;
+        rand_two = random() % t->key_count;
+        temp = keys[rand_one];
+        keys[rand_one] = keys[rand_two];
+        keys[rand_two] = temp;
+    }
+    }
+    /* in case you want to peek at the shuffling :P
+    for (i = 0; i < t->key_count; i++) {
+        fprintf(stdout, "Key: %.*s\n", (int)keys[i].key_len, keys[i].key);
+    }*/
 }
 
 /* Get a little verbose to avoid a big if/else if tree */
@@ -538,6 +570,8 @@ static void parse_config_line(char *line) {
         VALUE_RANGE_STEP,
         MGET_COUNT,
         VALUE,
+        RANDOMIZE,
+        KEY_COUNT,
     };
 
     char *const key_options[] = {
@@ -557,6 +591,8 @@ static void parse_config_line(char *line) {
         [VALUE_RANGE_STEP] = "value_range_step",
         [MGET_COUNT]       = "mget_count",
         [VALUE]            = "value",
+        [RANDOMIZE]        = "key_randomize",
+        [KEY_COUNT]        = "key_count",
         NULL
     };
 
@@ -567,6 +603,8 @@ static void parse_config_line(char *line) {
     template.value_size = 2;
     template.value[0] = '\0';
     template.buf_written = 0;
+    template.key_count = 200000;
+    template.key_randomize = 0;
 
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
@@ -630,12 +668,16 @@ static void parse_config_line(char *line) {
             strcpy(template.value, value);
             template.value_size = strlen(value);
             break;
+        case RANDOMIZE:
+            template.key_randomize = atoi(value);
+            break;
+        case KEY_COUNT:
+            template.key_count = atoi(value);
+            break;
         }
     }
 
-    /* use in the future.
     prealloc_keys(&template);
-    */
 
     for (i = 0; i < conns_tomake; i++) {
         newsock = new_connection(&template);
