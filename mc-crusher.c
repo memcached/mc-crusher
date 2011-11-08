@@ -79,6 +79,7 @@ struct connection {
     uint64_t key_count;
     uint64_t key_randomize;
     uint64_t cur_key;
+    int      key_prealloc;
     struct mc_key *keys;
     unsigned char wbuf[65536];
     unsigned char rbuf[4096];
@@ -323,7 +324,7 @@ static void write_ascii_get_to_client(void *arg) {
    all of its time in the syscalls already.
    So I'm not prioritizing this change right now.
  */
-static void future_write_ascii_get_to_client(void *arg) {
+static void iov_write_ascii_get_to_client(void *arg) {
     struct connection *c = arg;
     int wbytes = 0;
     struct iovec vecs[3];
@@ -552,6 +553,7 @@ static void parse_config_line(char *line) {
     int newsock;
     int i;
     char *tmp;
+    char *sender = NULL;
 
     enum {
         SEND = 0,
@@ -572,6 +574,7 @@ static void parse_config_line(char *line) {
         VALUE,
         RANDOMIZE,
         KEY_COUNT,
+        KEY_PREALLOC,
     };
 
     char *const key_options[] = {
@@ -593,6 +596,7 @@ static void parse_config_line(char *line) {
         [VALUE]            = "value",
         [RANDOMIZE]        = "key_randomize",
         [KEY_COUNT]        = "key_count",
+        [KEY_PREALLOC]     = "key_prealloc",
         NULL
     };
 
@@ -605,6 +609,7 @@ static void parse_config_line(char *line) {
     template.buf_written = 0;
     template.key_count = 200000;
     template.key_randomize = 0;
+    template.key_prealloc = 1;
 
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
@@ -627,25 +632,7 @@ static void parse_config_line(char *line) {
 
         switch (key) {
         case SEND:
-            if (strcmp(value, "ascii_set") == 0) {
-                template.writer = write_ascii_set_to_client;
-            } else if (strcmp(value, "ascii_get") == 0) {
-                template.writer = write_ascii_get_to_client;
-            } else if (strcmp(value, "ascii_mget") == 0) {
-                template.writer = write_ascii_mget_to_client;
-            } else if (strcmp(value, "bin_get") == 0) {
-                init_bin_get(&template);
-                template.writer = write_bin_get_to_client;
-            } else if (strcmp(value, "bin_getq") == 0) {
-                init_bin_getq(&template);
-                template.writer = write_bin_getq_to_client;
-            } else if (strcmp(value, "bin_set") == 0) {
-                init_bin_set(&template);
-                template.writer = write_bin_set_to_client;
-            } else if (strcmp(value, "bin_setq") == 0) {
-                init_bin_setq(&template);
-                template.writer = write_bin_setq_to_client;
-            }
+            sender = value;
             break;
         case RECV:
             template.reader = read_from_client;
@@ -674,10 +661,45 @@ static void parse_config_line(char *line) {
         case KEY_COUNT:
             template.key_count = atoi(value);
             break;
+        case KEY_PREALLOC:
+            template.key_prealloc = atoi(value);
+            break;
         }
     }
 
-    prealloc_keys(&template);
+    /* Gross double tree. Hey, it's string parsing in C! */
+    if (template.key_prealloc) {
+        prealloc_keys(&template);
+        if (strcmp(sender, "ascii_get") == 0) {
+            template.writer = iov_write_ascii_get_to_client;
+        } else {
+            fprintf(stderr, "Unknown command writer: %s", sender);
+            exit(1);
+        }
+    } else {
+        if (strcmp(sender, "ascii_set") == 0) {
+            template.writer = write_ascii_set_to_client;
+        } else if (strcmp(sender, "ascii_get") == 0) {
+            template.writer = write_ascii_get_to_client;
+        } else if (strcmp(sender, "ascii_mget") == 0) {
+            template.writer = write_ascii_mget_to_client;
+        } else if (strcmp(sender, "bin_get") == 0) {
+            init_bin_get(&template);
+            template.writer = write_bin_get_to_client;
+        } else if (strcmp(sender, "bin_getq") == 0) {
+            init_bin_getq(&template);
+            template.writer = write_bin_getq_to_client;
+        } else if (strcmp(sender, "bin_set") == 0) {
+            init_bin_set(&template);
+            template.writer = write_bin_set_to_client;
+        } else if (strcmp(sender, "bin_setq") == 0) {
+            init_bin_setq(&template);
+            template.writer = write_bin_setq_to_client;
+        } else {
+            fprintf(stderr, "Unknown command writer: %s", sender);
+            exit(1);
+        }
+    }
 
     for (i = 0; i < conns_tomake; i++) {
         newsock = new_connection(&template);
