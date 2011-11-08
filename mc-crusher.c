@@ -311,7 +311,7 @@ static void write_ascii_get_to_client(void *arg) {
    all of its time in the syscalls already.
    So I'm not prioritizing this change right now.
  */
-static void iov_write_ascii_get_to_client(void *arg) {
+static void prealloc_write_ascii_get_to_client(void *arg) {
     struct connection *c = arg;
     int wbytes = 0;
     struct iovec vecs[3];
@@ -658,7 +658,7 @@ static void parse_config_line(char *line) {
     if (template.key_prealloc) {
         prealloc_keys(&template);
         if (strcmp(sender, "ascii_get") == 0) {
-            template.writer = iov_write_ascii_get_to_client;
+            template.writer = prealloc_write_ascii_get_to_client;
         } else {
             fprintf(stderr, "Unknown command writer: %s", sender);
             exit(1);
