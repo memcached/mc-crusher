@@ -55,6 +55,10 @@ struct mc_key {
 };
 
 struct connection {
+    /* host */
+    char ip_addr[60];
+    int port_num;
+
     /* Event stuff */
     int fd;
     struct event ev;
@@ -397,16 +401,14 @@ static int new_connection(struct connection *t)
     int sock;
     struct sockaddr_in dest_addr;
     int flags = 1;
-    const char *ip_addr = "127.0.0.1";
-    int port_num = 11211;
     struct connection *c = (struct connection *)malloc(sizeof(struct connection));
     memcpy(c, t, sizeof(struct connection));
 
     sock = socket(AF_INET, SOCK_STREAM, 0);
 
     dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(port_num);
-    dest_addr.sin_addr.s_addr = inet_addr(ip_addr);
+    dest_addr.sin_port = htons(c->port_num);
+    dest_addr.sin_addr.s_addr = inet_addr(c->ip_addr);
 
     if ( (flags = fcntl(sock, F_GETFL, 0)) < 0 ||
         fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
@@ -562,6 +564,8 @@ static void parse_config_line(char *line) {
         RANDOMIZE,
         KEY_COUNT,
         KEY_PREALLOC,
+        HOST,
+        PORT
     };
 
     char *const key_options[] = {
@@ -584,6 +588,8 @@ static void parse_config_line(char *line) {
         [RANDOMIZE]        = "key_randomize",
         [KEY_COUNT]        = "key_count",
         [KEY_PREALLOC]     = "key_prealloc",
+        [HOST]             = "host",
+        [PORT]             = "port",
         NULL
     };
 
@@ -597,6 +603,8 @@ static void parse_config_line(char *line) {
     template.key_count = 200000;
     template.key_randomize = 0;
     template.key_prealloc = 1;
+    strcpy(template.ip_addr, "127.0.0.1");
+    template.port_num = 11211;
 
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
@@ -650,6 +658,12 @@ static void parse_config_line(char *line) {
             break;
         case KEY_PREALLOC:
             template.key_prealloc = atoi(value);
+            break;
+        case HOST:
+            strcpy(template.ip_addr, value);
+            break;
+        case PORT:
+            template.port_num = atoi(value);
             break;
         }
     }
