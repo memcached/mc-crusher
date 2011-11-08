@@ -67,6 +67,17 @@ value_size : size of the value to set
 
 value : define a value by hand. Must be shortish and a string.
 
+host : define a host to connect to
+
+port : define a port to connect to
+
+key_prealloc : pre-create key strings in memory to reduce bench cpu usage
+
+key_count : number of keys to iterate across. use with key_prealloc=0 to
+iterate over large numbers of keys
+
+key_randomize : if using prealloc'ed keys, shuffle the list after generating
+
 Caveats
 -------
 

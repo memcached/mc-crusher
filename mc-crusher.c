@@ -79,7 +79,7 @@ struct connection {
     protocol_binary_request_get bin_get_pkt;
     protocol_binary_request_set bin_set_pkt;
 
-    /* Buffers and writer/reader pointers */
+    /* Buffers */
     uint64_t key_count;
     uint64_t key_randomize;
     uint64_t cur_key;
@@ -87,6 +87,12 @@ struct connection {
     struct mc_key *keys;
     unsigned char wbuf[65536];
     unsigned char rbuf[4096];
+
+    /* iovectors */
+    struct iovec *vecs;
+    int    iov_count; /* iovecs in use */
+
+    /* reader/writer function pointers */
     void (*writer)(void *arg);
     void (*reader)(void *arg);
 };
