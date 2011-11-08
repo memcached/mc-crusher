@@ -327,19 +327,25 @@ static void iov_write_ascii_get_to_client(void *arg) {
     run_counter(c);
 }
 
+/* Will break hard if value is too large to write in one go.
+   Need to add a "load iovec -> drain iovec" process
+ */
 static void write_ascii_set_to_client(void *arg) {
     struct connection *c = arg;
     int wbytes = 0;
-    int towrite = 0;
-    towrite = sprintf(c->wbuf, "set %s%llu 0 0 %d\r\n", c->key_prefix,
+    struct iovec vecs[3];
+    vecs[0].iov_base = c->wbuf;
+    vecs[0].iov_len  = sprintf(c->wbuf, "set %s%llu 0 0 %d\r\n", c->key_prefix,
         (unsigned long long)c->cur_key, c->value_size);
-    wbytes = send(c->fd, &c->wbuf, towrite, 0);
     if (c->value[0] == '\0') {
-        wbytes = send(c->fd, shared_value, c->value_size, 0);
+        vecs[1].iov_base = shared_value;
     } else {
-        wbytes = send(c->fd, c->value, c->value_size, 0);
+        vecs[1].iov_base = c->value;
     }
-    wbytes = send(c->fd, "\r\n", 2, 0);
+    vecs[1].iov_len  = c->value_size;
+    vecs[2].iov_base = "\r\n";
+    vecs[2].iov_len  = 2;
+    wbytes = writev(c->fd, vecs, 3);
     c->state = conn_reading;
     run_counter(c);
 }
