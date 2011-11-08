@@ -91,6 +91,13 @@ static struct event_base *main_base;
 
 static void client_handler(const int fd, const short which, void *arg);
 
+static inline void run_counter(struct connection *c) {
+    if (c->cur_key++ >= c->key_count) {
+        fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
+        c->cur_key = 0;
+    }
+}
+
 static int update_conn_event(struct connection *c, const int new_flags)
 {
     if (c->ev_flags == new_flags) return 1;
@@ -110,16 +117,13 @@ static void write_bin_get_to_client(void *arg) {
     uint32_t keylen = 0;
 
     keylen = sprintf(c->wbuf + sizeof(c->bin_get_pkt), "%s%llu", c->key_prefix,
-        (unsigned long long)counter++);
+        (unsigned long long)c->cur_key);
     c->bin_get_pkt.message.header.request.keylen = htons(keylen);
     c->bin_get_pkt.message.header.request.bodylen = htonl(keylen);
     memcpy(c->wbuf, (char *)&c->bin_get_pkt.bytes, sizeof(c->bin_get_pkt));
     wbytes = send(c->fd, c->wbuf, sizeof(c->bin_get_pkt) + keylen, 0);
     c->state = conn_reading;
-    if (counter > reset_counter_after) {
-        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
-        counter = 0;
-    }
+    run_counter(c);
 }
 
 static void write_bin_getq_to_client(void *arg) {
@@ -154,16 +158,12 @@ static void write_bin_getq_to_client(void *arg) {
         towrite = 0;
         while (towrite < (4096 - (psize + 250))) {
             keylen = sprintf(c->wbuf + towrite + psize, "%s%llu",
-                c->key_prefix, (unsigned long long)counter++);
+                c->key_prefix, (unsigned long long)c->cur_key);
             c->bin_get_pkt.message.header.request.keylen = htons(keylen);
             c->bin_get_pkt.message.header.request.bodylen = htonl(keylen);
             memcpy(c->wbuf + towrite, (char *)&c->bin_get_pkt.bytes, psize);
             towrite += keylen + psize;
-            if (counter > reset_counter_after) {
-                fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
-                counter = 0;
-            }
-
+            run_counter(c);
         }
         wbytes = send(c->fd, c->wbuf, towrite, 0);
         if (wbytes == -1) {
@@ -192,7 +192,7 @@ static void write_bin_set_to_client(void *arg) {
     uint32_t keylen = 0;
 
     keylen = sprintf(c->wbuf + sizeof(c->bin_set_pkt), "%s%llu", c->key_prefix,
-        (unsigned long long)counter++);
+        (unsigned long long)c->cur_key);
     c->bin_set_pkt.message.header.request.keylen = htons(keylen);
     c->bin_set_pkt.message.header.request.bodylen = htonl(keylen +
         c->value_size + 8);
@@ -205,10 +205,7 @@ static void write_bin_set_to_client(void *arg) {
     }
 
     c->state = conn_reading;
-    if (counter > reset_counter_after) {
-        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
-        counter = 0;
-    }
+    run_counter(c);
 
     return;
 }
@@ -246,7 +243,7 @@ static void write_bin_setq_to_client(void *arg) {
         towrite = 0;
         while (towrite < (4096 - (psize + 250))) {
             keylen = sprintf(c->wbuf + towrite + psize, "%s%llu",
-                c->key_prefix, (unsigned long long)counter++);
+                c->key_prefix, (unsigned long long)c->cur_key);
             c->bin_set_pkt.message.header.request.keylen = htons(keylen);
             c->bin_set_pkt.message.header.request.bodylen = htonl(keylen + 8 +
                 c->value_size);
@@ -259,11 +256,7 @@ static void write_bin_setq_to_client(void *arg) {
             }
             towrite += c->value_size;
 
-            if (counter > reset_counter_after) {
-                fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
-                counter = 0;
-            }
-
+            run_counter(c);
         }
         wbytes = send(c->fd, c->wbuf, towrite, 0);
         if (wbytes == -1) {
@@ -295,28 +288,22 @@ static void write_ascii_mget_to_client(void *arg) {
     written += 4;
     for (i = 0; i < c->mget_count; i++) {
         written += sprintf(c->wbuf + written, "%s%llu ",
-            c->key_prefix, (unsigned long long)counter++);
+            c->key_prefix, (unsigned long long)c->cur_key);
+        run_counter(c);
     }
     strcpy(c->wbuf + (written), "\r\n");
     wbytes = send(c->fd, &c->wbuf, written + 2, 0);
     c->state = conn_reading;
-    if (counter > reset_counter_after) {
-        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
-        counter = 0;
-    }
 }
 
 static void write_ascii_get_to_client(void *arg) {
     struct connection *c = arg;
     int wbytes = 0;
     sprintf(c->wbuf, "get %s%llu\r\n", c->key_prefix,
-        (unsigned long long)counter++);
+        (unsigned long long)c->cur_key);
     wbytes = send(c->fd, &c->wbuf, strlen(c->wbuf), 0);
     c->state = conn_reading;
-    if (counter > reset_counter_after) {
-        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
-        counter = 0;
-    }
+    run_counter(c);
 }
 
 /* Example of how to rewrite these functions.
@@ -337,10 +324,7 @@ static void iov_write_ascii_get_to_client(void *arg) {
     
     wbytes = writev(c->fd, vecs, 3);
     c->state = conn_reading;
-    if (c->cur_key++ >= c->key_count) {
-        fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
-        c->cur_key = 0;
-    }
+    run_counter(c);
 }
 
 static void write_ascii_set_to_client(void *arg) {
@@ -348,7 +332,7 @@ static void write_ascii_set_to_client(void *arg) {
     int wbytes = 0;
     int towrite = 0;
     towrite = sprintf(c->wbuf, "set %s%llu 0 0 %d\r\n", c->key_prefix,
-        (unsigned long long)counter++, c->value_size);
+        (unsigned long long)c->cur_key, c->value_size);
     wbytes = send(c->fd, &c->wbuf, towrite, 0);
     if (c->value[0] == '\0') {
         wbytes = send(c->fd, shared_value, c->value_size, 0);
@@ -357,10 +341,7 @@ static void write_ascii_set_to_client(void *arg) {
     }
     wbytes = send(c->fd, "\r\n", 2, 0);
     c->state = conn_reading;
-    if (counter > reset_counter_after) {
-        fprintf(stdout, "Did %llu writes\n", (unsigned long long)counter);
-        counter = 0;
-    }
+    run_counter(c);
 }
 
 static void read_from_client(void *arg) {
