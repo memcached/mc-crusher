@@ -571,7 +571,7 @@ static void init_bin_setq(struct connection *t) {
     t->bin_set_pkt.message.header.request.opcode = PROTOCOL_BINARY_CMD_SETQ;
 }
 
-static void prealloc_keys(struct connection *t) {
+static void prealloc_keys(struct connection *t, int add_space) {
     /* This "leaks" the blob on purpose. Also temporary hardcoded rough key
      * length is used. 
      */
@@ -584,6 +584,13 @@ static void prealloc_keys(struct connection *t) {
     int len = 0;
     long int rand_one;
     long int rand_two;
+    char *fmt;
+
+    if (add_space == 1) {
+        fmt = "%s%llu ";
+    } else {
+        fmt = "%s%llu";
+    }
 
     /* Generate the blobs and key list */
     key_blob = calloc(t->key_count, 30);
@@ -597,7 +604,7 @@ static void prealloc_keys(struct connection *t) {
         (unsigned long long)sizeof(struct mc_key) * (t->key_count));
 
     for (i = 0; i < t->key_count; i++) {
-        len = sprintf(key_blob_ptr, "%s%llu", t->key_prefix,
+        len = sprintf(key_blob_ptr, fmt, t->key_prefix,
             (unsigned long long)i);
         keys[i].key     = key_blob_ptr;
         keys[i].key_len = len;
@@ -638,6 +645,7 @@ static void parse_config_line(char *line) {
     int i;
     char *tmp;
     char *sender = NULL;
+    int add_space = 0;
 
     enum {
         SEND = 0,
@@ -767,17 +775,18 @@ static void parse_config_line(char *line) {
 
     /* Gross double tree. Hey, it's string parsing in C! */
     if (template.key_prealloc) {
-        prealloc_keys(&template);
         if (strcmp(sender, "ascii_get") == 0) {
             template.writer = prealloc_write_ascii_get_to_client;
             template.iov_count = 3;
         } else if (strcmp(sender, "ascii_mget") == 0) {
-            template.writer = write_ascii_mget_to_client;
+            template.writer = prealloc_write_ascii_mget_to_client;
             template.iov_count = template.mget_count + 2;
+            add_space = 1;
         } else {
             fprintf(stderr, "Unknown command writer: %s", sender);
             exit(1);
         }
+        prealloc_keys(&template, add_space);
     } else {
         if (strcmp(sender, "ascii_set") == 0) {
             template.writer = write_ascii_set_to_client;
