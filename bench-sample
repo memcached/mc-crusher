@@ -1,59 +1,54 @@
 #!/usr/bin/perl
 # public domain
 # benchmark sampler by dormando.
-# It says "redis" in a few places because I wrote this for that redis v.
-# memcached benchmark and I've decided to write thi scomment instead of edit
-# the code right now.
 
 use warnings;
 use strict;
 use IO::Socket::INET;
 use Time::HiRes;
 
-my $type        = $ARGV[0];
-my $SAMPLE_TIME = $ARGV[1] || 2;
+my $host        = shift @ARGV;
+my $SAMPLE_TIME = shift @ARGV || 2;
+my @TO_SAMPLE   = @ARGV;
+unless (@TO_SAMPLE) {
+    @TO_SAMPLE = ('cmd_get');
+}
+my $longest = 0;
+for (@TO_SAMPLE) {
+    $longest = length($_) if length($_) > $longest;
+}
+$longest++;
 
-my $addr = $type eq 'redis' ? "127.0.0.1:6379" : "127.0.0.1:11211";
-my $s = connect_to($addr);
+my $s = connect_to($host);
 die $@ unless $s;
 
-my $one      = $type eq 'redis' ? redis_info($s) : mc_info($s);
+my $one      = mc_info($s);
 my $one_time = Time::HiRes::time;
 
 sleep $SAMPLE_TIME;
 
-my $two      = $type eq 'redis' ? redis_info($s) : mc_info($s);
+my $two      = mc_info($s);
 my $two_time = Time::HiRes::time;
 
 my $elapsed = $two_time - $one_time;
-my $per_sec = ($two - $one) / $elapsed;
-print "$type per-second average ($SAMPLE_TIME): $per_sec\n";
 
-sub redis_info {
-    my $s = shift;
-    print $s "info\r\n";
-    while (my $line = <$s>) {
-        if ($line =~ m/total_commands_processed:(\d+)/) {
-            return $1;
-        }
-    }
+for my $stat (@TO_SAMPLE) {
+    my $per_sec = ($two->{$stat} - $one->{$stat}) / $elapsed;
+    printf "%-${longest}s avg/s (%2s/s sample): %s\n", $stat,
+        $SAMPLE_TIME, $per_sec;
 }
 
 sub mc_info {
     my $s = shift;
     print $s "stats\r\n";
-    my $get = -1;
-    my $set = -1;
+    my %stats = ();
     while (my $line = <$s>) {
         last if $line =~ m/^END/;
-        if ($line =~ m/^STAT cmd_get (\d+)/) {
-            $get = $1;
-        } elsif ($line =~ m/STAT cmd_set (\d+)/) {
-            $set = $1;
+        if ($line =~ m/^STAT (\S+) (\d+)/) {
+            $stats{$1} = $2;
         }
     }
-    # Just comparing the combined stats...
-    return $get + $set;
+    return \%stats;
 }
 
 sub connect_to {
