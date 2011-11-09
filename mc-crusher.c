@@ -91,6 +91,7 @@ struct connection {
     /* iovectors */
     struct iovec *vecs;
     int    iov_count; /* iovecs in use */
+    int    iov_towrite; /* bytes to write */
 
     /* reader/writer function pointers */
     void (*writer)(void *arg);
@@ -100,13 +101,6 @@ struct connection {
 static struct event_base *main_base;
 
 static void client_handler(const int fd, const short which, void *arg);
-
-static inline void run_counter(struct connection *c) {
-    if (c->cur_key++ >= c->key_count) {
-        fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
-        c->cur_key = 0;
-    }
-}
 
 static int update_conn_event(struct connection *c, const int new_flags)
 {
@@ -119,6 +113,69 @@ static int update_conn_event(struct connection *c, const int new_flags)
 
     if (event_add(&c->ev, 0) == -1) return 0;
     return 1;
+}
+
+/* TODO: Be more wary of IOV_MAX */
+static void drain_iovecs(struct iovec *vecs, const int iov_count, const int written) {
+    int i;
+    int todrain = written;
+    for (i = 0; i < iov_count; i++) {
+        if (vecs[i].iov_len > 0) {
+            if (todrain >= vecs[i].iov_len) {
+                todrain -= vecs[i].iov_len;
+                vecs[i].iov_base = NULL;
+                vecs[i].iov_len  = 0;
+            } else {
+                vecs[i].iov_len -= todrain;
+                vecs[i].iov_base += todrain;
+                break;
+            }
+        }
+    }
+}
+
+static void write_iovecs(struct connection *c, enum conn_states next_state) {
+    int written = 0;
+    written = writev(c->fd, c->vecs, c->iov_count);
+    if (written == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            c->state = conn_reading;
+            return;
+        } else {
+            perror("Write error to client");
+            exit(1);
+            return;
+        }
+    }
+
+    c->iov_towrite -= written;
+    if (c->iov_towrite > 0) {
+        update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
+        fprintf(stderr, "Draining iovecs to %d (%d)\n", c->iov_towrite, written);
+        drain_iovecs(c->vecs, c->iov_count, written);
+        c->state = conn_sending;
+    } else {
+        c->state = next_state;
+        if (c->state == conn_reading) {
+            update_conn_event(c, EV_READ | EV_PERSIST);
+        }
+    }
+}
+
+static inline int sum_iovecs(const struct iovec *vecs, const int iov_count) {
+    int i;
+    int sum = 0;
+    for (i = 0; i < iov_count; i++) {
+        sum += vecs[i].iov_len;
+    }
+    return sum;
+}
+
+static inline void run_counter(struct connection *c) {
+    if (++c->cur_key >= c->key_count) {
+        fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
+        c->cur_key = 0;
+    }
 }
 
 static void write_bin_get_to_client(void *arg) {
@@ -324,16 +381,16 @@ static void write_ascii_get_to_client(void *arg) {
 static void prealloc_write_ascii_get_to_client(void *arg) {
     struct connection *c = arg;
     int wbytes = 0;
-    struct iovec vecs[3];
+    struct iovec *vecs = c->vecs;
     vecs[0].iov_base = "get ";
     vecs[0].iov_len = 4;
     vecs[1].iov_base = c->keys[c->cur_key].key;
     vecs[1].iov_len  = c->keys[c->cur_key].key_len;
     vecs[2].iov_base = "\r\n";
     vecs[2].iov_len = 2;
-    
-    wbytes = writev(c->fd, vecs, 3);
-    c->state = conn_reading;
+
+    c->iov_towrite = sum_iovecs(vecs, c->iov_count);
+    write_iovecs(c, conn_reading);
     run_counter(c);
 }
 
@@ -343,7 +400,7 @@ static void prealloc_write_ascii_get_to_client(void *arg) {
 static void write_ascii_set_to_client(void *arg) {
     struct connection *c = arg;
     int wbytes = 0;
-    struct iovec vecs[3];
+    struct iovec *vecs = c->vecs;
     vecs[0].iov_base = c->wbuf;
     vecs[0].iov_len  = sprintf(c->wbuf, "set %s%llu 0 0 %d\r\n", c->key_prefix,
         (unsigned long long)c->cur_key, c->value_size);
@@ -355,8 +412,9 @@ static void write_ascii_set_to_client(void *arg) {
     vecs[1].iov_len  = c->value_size;
     vecs[2].iov_base = "\r\n";
     vecs[2].iov_len  = 2;
-    wbytes = writev(c->fd, vecs, 3);
-    c->state = conn_reading;
+    c->iov_towrite = sum_iovecs(vecs, c->iov_count);
+    write_iovecs(c, conn_reading);
+
     run_counter(c);
 }
 
@@ -375,13 +433,13 @@ static void read_from_client(void *arg) {
         if (rbytes < 4095)
             break; /* don't call read() again unless we may get data */
     }
-    c->writer(c);
 }
 
 static void client_handler(const int fd, const short which, void *arg) {
     struct connection *c = (struct connection *)arg;
     int err = 0;
     socklen_t errsize = sizeof(err);
+    int written = 0;
 
     switch (c->state) {
     case conn_connecting:
@@ -394,10 +452,22 @@ static void client_handler(const int fd, const short which, void *arg) {
         c->state = conn_sending;
         update_conn_event(c, EV_READ | EV_PERSIST);
     case conn_sending:
-        c->writer(c);
+        if (which & EV_READ) {
+            c->reader(c);
+        } 
+        if (which & EV_WRITE) {
+            if (c->iov_towrite > 0)
+                /* FIXME: Need to cuddle this from the writer or somefuck. */
+                write_iovecs(c, conn_reading);
+            if (c->iov_towrite <= 0)
+                c->writer(c);
+        }
         break;
     case conn_reading:
         c->reader(c);
+        c->state = conn_sending;
+        if (c->iov_towrite <= 0)
+            c->writer(c);
         break;
     }
 }
@@ -443,6 +513,14 @@ static int new_connection(struct connection *t)
 
     if (c->key_randomize) {
         c->cur_key = random() % c->key_count;
+    }
+
+    if (c->iov_count > 0) {
+        c->vecs = calloc(c->iov_count, sizeof(struct iovec));
+        if (c->vecs == NULL) {
+            fprintf(stderr, "Couldn't allocate iovecs\n");
+            exit(1);
+        }
     }
 
     return sock;
@@ -679,6 +757,7 @@ static void parse_config_line(char *line) {
         prealloc_keys(&template);
         if (strcmp(sender, "ascii_get") == 0) {
             template.writer = prealloc_write_ascii_get_to_client;
+            template.iov_count = 3;
         } else {
             fprintf(stderr, "Unknown command writer: %s", sender);
             exit(1);
@@ -686,6 +765,7 @@ static void parse_config_line(char *line) {
     } else {
         if (strcmp(sender, "ascii_set") == 0) {
             template.writer = write_ascii_set_to_client;
+            template.iov_count = 3;
         } else if (strcmp(sender, "ascii_get") == 0) {
             template.writer = write_ascii_get_to_client;
         } else if (strcmp(sender, "ascii_mget") == 0) {
