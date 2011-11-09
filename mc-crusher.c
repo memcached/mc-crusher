@@ -151,7 +151,7 @@ static void write_iovecs(struct connection *c, enum conn_states next_state) {
     c->iov_towrite -= written;
     if (c->iov_towrite > 0) {
         update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
-        fprintf(stderr, "Draining iovecs to %d (%d)\n", c->iov_towrite, written);
+        //fprintf(stderr, "Draining iovecs to %d (%d)\n", c->iov_towrite, written);
         drain_iovecs(c->vecs, c->iov_count, written);
         c->state = conn_sending;
     } else {

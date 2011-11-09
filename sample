@@ -1,2 +1,2 @@
 #!/bin/bash
-while true ; do ./bench-sample 127.0.0.1:11211 4 cmd_get get_hits cmd_set ; sleep 1 ; done
+while true ; do ./bench-sample 127.0.0.1:11211 4 cmd_get cmd_set ; sleep 1 ; done
