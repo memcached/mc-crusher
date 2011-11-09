@@ -363,6 +363,23 @@ static void write_ascii_mget_to_client(void *arg) {
     c->state = conn_reading;
 }
 
+static void prealloc_write_ascii_mget_to_client(void *arg) {
+    struct connection *c = arg;
+    int i;
+    struct iovec *vecs = c->vecs;
+    vecs[0].iov_base = "get ";
+    vecs[0].iov_len  = 4;
+    for (i = 1; i < c->mget_count + 1; i++) {
+        vecs[i].iov_base = c->keys[c->cur_key].key;
+        vecs[i].iov_len  = c->keys[c->cur_key].key_len;
+        run_counter(c);
+    }
+    vecs[i].iov_base = "\r\n";
+    vecs[i].iov_len  = 2;
+    c->iov_towrite = sum_iovecs(vecs, c->iov_count);
+    write_iovecs(c, conn_reading);
+}
+
 static void write_ascii_get_to_client(void *arg) {
     struct connection *c = arg;
     int wbytes = 0;
@@ -380,7 +397,6 @@ static void write_ascii_get_to_client(void *arg) {
  */
 static void prealloc_write_ascii_get_to_client(void *arg) {
     struct connection *c = arg;
-    int wbytes = 0;
     struct iovec *vecs = c->vecs;
     vecs[0].iov_base = "get ";
     vecs[0].iov_len = 4;
@@ -399,7 +415,6 @@ static void prealloc_write_ascii_get_to_client(void *arg) {
  */
 static void write_ascii_set_to_client(void *arg) {
     struct connection *c = arg;
-    int wbytes = 0;
     struct iovec *vecs = c->vecs;
     vecs[0].iov_base = c->wbuf;
     vecs[0].iov_len  = sprintf(c->wbuf, "set %s%llu 0 0 %d\r\n", c->key_prefix,
@@ -758,6 +773,9 @@ static void parse_config_line(char *line) {
         if (strcmp(sender, "ascii_get") == 0) {
             template.writer = prealloc_write_ascii_get_to_client;
             template.iov_count = 3;
+        } else if (strcmp(sender, "ascii_mget") == 0) {
+            template.writer = write_ascii_mget_to_client;
+            template.iov_count = template.mget_count + 2;
         } else {
             fprintf(stderr, "Unknown command writer: %s", sender);
             exit(1);
