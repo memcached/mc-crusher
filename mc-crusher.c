@@ -173,7 +173,7 @@ static inline int sum_iovecs(const struct iovec *vecs, const int iov_count) {
 
 static inline void run_counter(struct connection *c) {
     if (++*c->cur_key >= c->key_count) {
-        fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
+        //fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
         *c->cur_key = 0;
     }
 }
@@ -429,6 +429,36 @@ static void write_ascii_set_to_client(void *arg) {
  * kinda needs to be pre-alloc'ed. So first extend the prealloc function to do
  * more formats
  */
+
+static void prealloc_write_ascii_incr_to_client(void *arg) {
+    struct connection *c = arg;
+    struct iovec *vecs = c->vecs;
+    vecs[0].iov_base = "incr ";
+    vecs[0].iov_len = 5;
+    vecs[1].iov_base = c->keys[*c->cur_key].key;
+    vecs[1].iov_len  = c->keys[*c->cur_key].key_len;
+    vecs[2].iov_base = " 1\r\n";
+    vecs[2].iov_len = 4;
+
+    c->iov_towrite = sum_iovecs(vecs, c->iov_count);
+    write_iovecs(c, conn_reading);
+    run_counter(c);
+}
+
+static void prealloc_write_ascii_decr_to_client(void *arg) {
+    struct connection *c = arg;
+    struct iovec *vecs = c->vecs;
+    vecs[0].iov_base = "decr ";
+    vecs[0].iov_len = 5;
+    vecs[1].iov_base = c->keys[*c->cur_key].key;
+    vecs[1].iov_len  = c->keys[*c->cur_key].key_len;
+    vecs[2].iov_base = " 1\r\n";
+    vecs[2].iov_len = 4;
+
+    c->iov_towrite = sum_iovecs(vecs, c->iov_count);
+    write_iovecs(c, conn_reading);
+    run_counter(c);
+}
 
 static void read_from_client(void *arg) {
     struct connection *c = arg;
@@ -779,6 +809,12 @@ static void parse_config_line(char *line) {
             template.writer = prealloc_write_ascii_mget_to_client;
             template.iov_count = template.mget_count + 2;
             add_space = 1;
+        } else if (strcmp(sender, "ascii_incr") == 0) {
+            template.writer = prealloc_write_ascii_incr_to_client;
+            template.iov_count = 3;
+        } else if (strcmp(sender, "ascii_decr") == 0) {
+            template.writer = prealloc_write_ascii_decr_to_client;
+            template.iov_count = 3;
         } else {
             fprintf(stderr, "Unknown command writer: %s", sender);
             exit(1);
