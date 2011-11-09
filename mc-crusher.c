@@ -83,7 +83,7 @@ struct connection {
     /* Buffers */
     uint64_t key_count;
     uint64_t key_randomize;
-    uint64_t cur_key;
+    uint64_t *cur_key;
     int      key_prealloc;
     struct mc_key *keys;
     unsigned char wbuf[65536];
@@ -172,9 +172,9 @@ static inline int sum_iovecs(const struct iovec *vecs, const int iov_count) {
 }
 
 static inline void run_counter(struct connection *c) {
-    if (++c->cur_key >= c->key_count) {
+    if (++*c->cur_key >= c->key_count) {
         fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
-        c->cur_key = 0;
+        *c->cur_key = 0;
     }
 }
 
@@ -184,7 +184,7 @@ static void write_bin_get_to_client(void *arg) {
     uint32_t keylen = 0;
 
     keylen = sprintf(c->wbuf + sizeof(c->bin_get_pkt), "%s%llu", c->key_prefix,
-        (unsigned long long)c->cur_key);
+        (unsigned long long)*c->cur_key);
     c->bin_get_pkt.message.header.request.keylen = htons(keylen);
     c->bin_get_pkt.message.header.request.bodylen = htonl(keylen);
     memcpy(c->wbuf, (char *)&c->bin_get_pkt.bytes, sizeof(c->bin_get_pkt));
@@ -225,7 +225,7 @@ static void write_bin_getq_to_client(void *arg) {
         towrite = 0;
         while (towrite < (4096 - (psize + 250))) {
             keylen = sprintf(c->wbuf + towrite + psize, "%s%llu",
-                c->key_prefix, (unsigned long long)c->cur_key);
+                c->key_prefix, (unsigned long long)*c->cur_key);
             c->bin_get_pkt.message.header.request.keylen = htons(keylen);
             c->bin_get_pkt.message.header.request.bodylen = htonl(keylen);
             memcpy(c->wbuf + towrite, (char *)&c->bin_get_pkt.bytes, psize);
@@ -259,7 +259,7 @@ static void write_bin_set_to_client(void *arg) {
     uint32_t keylen = 0;
 
     keylen = sprintf(c->wbuf + sizeof(c->bin_set_pkt), "%s%llu", c->key_prefix,
-        (unsigned long long)c->cur_key);
+        (unsigned long long)*c->cur_key);
     c->bin_set_pkt.message.header.request.keylen = htons(keylen);
     c->bin_set_pkt.message.header.request.bodylen = htonl(keylen +
         c->value_size + 8);
@@ -310,7 +310,7 @@ static void write_bin_setq_to_client(void *arg) {
         towrite = 0;
         while (towrite < (4096 - (psize + 250))) {
             keylen = sprintf(c->wbuf + towrite + psize, "%s%llu",
-                c->key_prefix, (unsigned long long)c->cur_key);
+                c->key_prefix, (unsigned long long)*c->cur_key);
             c->bin_set_pkt.message.header.request.keylen = htons(keylen);
             c->bin_set_pkt.message.header.request.bodylen = htonl(keylen + 8 +
                 c->value_size);
@@ -355,7 +355,7 @@ static void write_ascii_mget_to_client(void *arg) {
     written += 4;
     for (i = 0; i < c->mget_count; i++) {
         written += sprintf(c->wbuf + written, "%s%llu ",
-            c->key_prefix, (unsigned long long)c->cur_key);
+            c->key_prefix, (unsigned long long)*c->cur_key);
         run_counter(c);
     }
     strcpy(c->wbuf + (written), "\r\n");
@@ -370,8 +370,8 @@ static void prealloc_write_ascii_mget_to_client(void *arg) {
     vecs[0].iov_base = "get ";
     vecs[0].iov_len  = 4;
     for (i = 1; i < c->mget_count + 1; i++) {
-        vecs[i].iov_base = c->keys[c->cur_key].key;
-        vecs[i].iov_len  = c->keys[c->cur_key].key_len;
+        vecs[i].iov_base = c->keys[*c->cur_key].key;
+        vecs[i].iov_len  = c->keys[*c->cur_key].key_len;
         run_counter(c);
     }
     vecs[i].iov_base = "\r\n";
@@ -384,7 +384,7 @@ static void write_ascii_get_to_client(void *arg) {
     struct connection *c = arg;
     int wbytes = 0;
     sprintf(c->wbuf, "get %s%llu\r\n", c->key_prefix,
-        (unsigned long long)c->cur_key);
+        (unsigned long long)*c->cur_key);
     wbytes = send(c->fd, &c->wbuf, strlen(c->wbuf), 0);
     c->state = conn_reading;
     run_counter(c);
@@ -400,8 +400,8 @@ static void prealloc_write_ascii_get_to_client(void *arg) {
     struct iovec *vecs = c->vecs;
     vecs[0].iov_base = "get ";
     vecs[0].iov_len = 4;
-    vecs[1].iov_base = c->keys[c->cur_key].key;
-    vecs[1].iov_len  = c->keys[c->cur_key].key_len;
+    vecs[1].iov_base = c->keys[*c->cur_key].key;
+    vecs[1].iov_len  = c->keys[*c->cur_key].key_len;
     vecs[2].iov_base = "\r\n";
     vecs[2].iov_len = 2;
 
@@ -418,7 +418,7 @@ static void write_ascii_set_to_client(void *arg) {
     struct iovec *vecs = c->vecs;
     vecs[0].iov_base = c->wbuf;
     vecs[0].iov_len  = sprintf(c->wbuf, "set %s%llu 0 0 %d\r\n", c->key_prefix,
-        (unsigned long long)c->cur_key, c->value_size);
+        (unsigned long long)*c->cur_key, c->value_size);
     if (c->value[0] == '\0') {
         vecs[1].iov_base = shared_value;
     } else {
@@ -525,10 +525,6 @@ static int new_connection(struct connection *t)
     event_set(&c->ev, sock, c->ev_flags, client_handler, (void *)c);
     event_base_set(main_base, &c->ev);
     event_add(&c->ev, NULL);
-
-    if (c->key_randomize) {
-        c->cur_key = random() % c->key_count;
-    }
 
     if (c->iov_count > 0) {
         c->vecs = calloc(c->iov_count, sizeof(struct iovec));
@@ -704,6 +700,8 @@ static void parse_config_line(char *line) {
     template.key_prealloc = 1;
     strcpy(template.ip_addr, "127.0.0.1");
     template.port_num = 11211;
+    template.cur_key = (uint64_t *)malloc(sizeof(uint64_t));
+    *template.cur_key = 0;
 
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
