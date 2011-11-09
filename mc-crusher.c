@@ -390,11 +390,6 @@ static void write_ascii_get_to_client(void *arg) {
     run_counter(c);
 }
 
-/* Example of how to rewrite these functions.
-   This *greatly* reduces the user cpu time, however the bench spends almost
-   all of its time in the syscalls already.
-   So I'm not prioritizing this change right now.
- */
 static void prealloc_write_ascii_get_to_client(void *arg) {
     struct connection *c = arg;
     struct iovec *vecs = c->vecs;
@@ -410,9 +405,6 @@ static void prealloc_write_ascii_get_to_client(void *arg) {
     run_counter(c);
 }
 
-/* Will break hard if value is too large to write in one go.
-   Need to add a "load iovec -> drain iovec" process
- */
 static void write_ascii_set_to_client(void *arg) {
     struct connection *c = arg;
     struct iovec *vecs = c->vecs;
@@ -432,6 +424,11 @@ static void write_ascii_set_to_client(void *arg) {
 
     run_counter(c);
 }
+
+/* TODO: Add a prealloc'ed ascii set. This is difficult since the whole header
+ * kinda needs to be pre-alloc'ed. So first extend the prealloc function to do
+ * more formats
+ */
 
 static void read_from_client(void *arg) {
     struct connection *c = arg;
