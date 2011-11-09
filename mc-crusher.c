@@ -42,6 +42,7 @@
 uint64_t counter;
 uint64_t reset_counter_after;
 unsigned char *shared_value;
+unsigned char *shared_rbuf[1024 * 64];
 
 enum conn_states {
     conn_connecting = 0,
@@ -86,7 +87,6 @@ struct connection {
     int      key_prealloc;
     struct mc_key *keys;
     unsigned char wbuf[65536];
-    unsigned char rbuf[4096];
 
     /* iovectors */
     struct iovec *vecs;
@@ -422,7 +422,7 @@ static void read_from_client(void *arg) {
     struct connection *c = arg;
     int rbytes = 0;
     for (;;) {
-        rbytes = read(c->fd, &c->rbuf, 4096);
+        rbytes = read(c->fd, shared_rbuf, 1024 * 32);
         if (rbytes == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
