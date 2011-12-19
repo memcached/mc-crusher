@@ -816,7 +816,7 @@ static void parse_config_line(char *line) {
             template.writer = prealloc_write_ascii_decr_to_client;
             template.iov_count = 3;
         } else {
-            fprintf(stderr, "Unknown command writer: %s", sender);
+            fprintf(stderr, "Unknown command writer: %s\n", sender);
             exit(1);
         }
         prealloc_keys(&template, add_space);
@@ -841,7 +841,7 @@ static void parse_config_line(char *line) {
             init_bin_setq(&template);
             template.writer = write_bin_setq_to_client;
         } else {
-            fprintf(stderr, "Unknown command writer: %s", sender);
+            fprintf(stderr, "Unknown command writer: %s\n", sender);
             exit(1);
         }
     }
