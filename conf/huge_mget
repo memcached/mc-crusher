@@ -1,0 +1,1 @@
+send=ascii_mget,recv=blind_read,conns=1,mget_count=500000,key_prefix=foobar,key_prealloc=1

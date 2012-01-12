@@ -1,0 +1,41 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use IO::Socket::INET;
+
+use FindBin;
+
+@ARGV == 2
+    or die "Usage: $FindBin::Script slabmin slabmax\n";
+
+my $addr    = "127.0.0.1:11211";
+my $slabmin  = $ARGV[0];
+my $slabmax = $ARGV[1];
+
+my $sock = IO::Socket::INET->new(PeerAddr => $addr,
+                                 Timeout  => 3);
+die "$!\n" unless $sock;
+
+$|++;
+
+while (1) {
+    my @slabs = (0, 0);
+    for (0 .. 1) {
+        while ($slabs[$_] == 0) {
+            my $rand = int(rand($slabmax))+1;
+            next if $rand < $slabmin;
+            next if $rand == $slabs[0];
+            $slabs[$_] = $rand;
+        }
+    }
+
+    print $sock "slabs reassign $slabs[0] $slabs[1]\r\n";
+#    print "slabs reassign $slabs[0] $slabs[1]\r\n";
+    my $res = scalar <$sock>;
+#    print "slabs reassign $slabs[0] $slabs[1]: $res" if $res !~ m/^OK/;
+    print "slabs reassign $slabs[0] $slabs[1]: $res";
+
+    sleep 1;
+}
