@@ -43,6 +43,8 @@ uint64_t counter;
 uint64_t reset_counter_after;
 unsigned char *shared_value;
 unsigned char *shared_rbuf[1024 * 64];
+char ip_addr_default[60] = "127.0.0.1";
+int port_num_default = 11211;
 
 enum conn_states {
     conn_connecting = 0,
@@ -733,8 +735,8 @@ static void parse_config_line(char *line) {
     template.key_count = 200000;
     template.key_randomize = 0;
     template.key_prealloc = 1;
-    strcpy(template.ip_addr, "127.0.0.1");
-    template.port_num = 11211;
+    strcpy(template.ip_addr, ip_addr_default);
+    template.port_num = port_num_default;
     template.cur_key = (uint64_t *)malloc(sizeof(uint64_t));
     *template.cur_key = 0;
 
@@ -861,6 +863,14 @@ int main(int argc, char **argv)
     shared_value = calloc(1024 * 1024, sizeof(unsigned char));
 
     main_base = event_init();
+    if (argc > 2) {
+        strncpy(ip_addr_default, argv[2], 60);
+        printf("ip address default: %s\n", ip_addr_default);
+    }
+    if (argc > 3) {
+        port_num_default = atoi(argv[3]);
+        printf("port default: %d\n", port_num_default);
+    }
 
     cfd = fopen(argv[1], "r");
     if (cfd == NULL) {
