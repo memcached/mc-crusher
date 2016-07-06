@@ -1,0 +1,29 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings FATAL => 'all';
+
+use IO::Socket::INET;
+
+my $addr = $ARGV[0];
+my $prefix = $ARGV[1];
+my $size = $ARGV[2];
+my $count = $ARGV[3];
+my $exptime = 0;
+
+die "bench-warmer addr prefix size count" unless $addr && $prefix && $size && $count;
+
+my $sock = IO::Socket::INET->new(PeerAddr => $addr,
+                                 Timeout  => 3);
+die "$!\n" unless $sock;
+
+$|++;
+my $data = '1';
+$data = 'x' x $size;
+foreach (1 .. $count) {
+    print $sock "set $prefix${_} 0 $exptime $size noreply\r\n", $data, "\r\n";
+    #scalar <$sock>;
+    print "Run: $_\n" if ($_ % int($count / 10) == 0);
+}
+print "\nDone setting\n";
+
