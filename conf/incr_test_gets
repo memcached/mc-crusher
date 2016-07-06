@@ -1,0 +1,1 @@
+send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,key_prealloc=1,key_count=100
