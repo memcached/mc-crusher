@@ -19,11 +19,12 @@ $ ./mc-crusher ./conf/loadconf
 Running
 -------
 
-This guy is extremely rough. It has hardcoded values such as a 200,000 item
-iteration loop. I'm releasing it early for shiggles.
+This tool is extremely rough.
 
 First, run it for a few seconds with a config like "conf/loadconf", this will
 seed the instance with some values to fetch later. Now, kill it.
+
+You can also use the bench-warmer.pl tool to preload some keys.
 
 Pick a config file, and start it as above. You should start a fresh memcached,
 and run the "sample" script that comes with mc-crusher. mc-crusher makes no
@@ -33,6 +34,9 @@ defenses of the cache daemon.
 Modify bench-sample to print what you are most interested in examining. Start
 multiple instances of mc-crusher if you think memcached can take more. In the
 future threads will be used for user convenience.
+
+You can change the "default" destination ip/port by adding extra arguments:
+$ ./mc-crusher ./conf/loadconf 192.168.1.1 11211
 
 Configuration
 -------------
@@ -81,18 +85,11 @@ key_randomize : if using prealloc'ed keys, shuffle the list after generating
 Caveats
 -------
 
-- I bundled the protocol_binary.h header because I'm an asshole, deal with it.
-
-- Hardcoded to hit a localhost instance. Just recompile if you want it
-elsehwere.
+- I bundled the protocol_binary.h header. It will need to be copied from the
+  primary repo for updates.
 
 - Does not make any attempt to safely parse the config file. If you don't type
   it exactly right you will end up with bizarre failures.
-
-- It is missing many features I intend to add and use; however as is it was
-  able to verify some lock scaling patches I worked on.
-
-- It mindlessly iterates through 200,000 keys.
 
 - It only works well with small values
 
