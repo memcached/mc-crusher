@@ -39,10 +39,9 @@
 
 #include "protocol_binary.h"
 
-uint64_t counter;
-uint64_t reset_counter_after;
-unsigned char *shared_value;
-unsigned char *shared_rbuf[1024 * 64];
+#define SHARED_RBUF_SIZE 1024 * 64
+#define SHARED_VALUE_SIZE 1024 * 1024
+
 char ip_addr_default[60] = "127.0.0.1";
 int port_num_default = 11211;
 
@@ -57,7 +56,17 @@ struct mc_key {
     size_t key_len;
 };
 
+typedef struct _mc_thread {
+    pthread_t thread_id;
+    struct event_base *base;
+    unsigned char *shared_value;
+    unsigned char *shared_rbuf;
+} mc_thread;
+
 struct connection {
+    /* Owner thread */
+    mc_thread *t;
+
     /* host */
     char ip_addr[60];
     int port_num;
@@ -98,9 +107,9 @@ struct connection {
     void (*reader)(void *arg);
 };
 
-static struct event_base *main_base;
-
 static void client_handler(const int fd, const short which, void *arg);
+static void setup_thread(mc_thread *t);
+static void create_thread(mc_thread *t);
 
 static int update_conn_event(struct connection *c, const int new_flags)
 {
@@ -109,7 +118,7 @@ static int update_conn_event(struct connection *c, const int new_flags)
 
     c->ev_flags = new_flags;
     event_set(&c->ev, c->fd, new_flags, client_handler, (void *)c);
-    event_base_set(main_base, &c->ev);
+    event_base_set(c->t->base, &c->ev);
 
     if (event_add(&c->ev, 0) == -1) return 0;
     return 1;
@@ -266,7 +275,7 @@ static void write_bin_set_to_client(void *arg) {
     memcpy(c->wbuf, (char *)&c->bin_set_pkt.bytes, sizeof(c->bin_set_pkt));
     wbytes = send(c->fd, c->wbuf, sizeof(c->bin_set_pkt) + keylen, 0);
     if (c->value[0] == '\0') {
-        wbytes = send(c->fd, shared_value, c->value_size, 0);
+        wbytes = send(c->fd, c->t->shared_value, c->value_size, 0);
     } else {
         wbytes = send(c->fd, c->value, c->value_size, 0);
     }
@@ -317,7 +326,7 @@ static void write_bin_setq_to_client(void *arg) {
             memcpy(c->wbuf + towrite, (char *)&c->bin_set_pkt.bytes, psize);
             towrite += keylen + psize;
             if (c->value[0] == '\0') {
-                memcpy(c->wbuf + towrite, shared_value, c->value_size);
+                memcpy(c->wbuf + towrite, c->t->shared_value, c->value_size);
             } else {
                 memcpy(c->wbuf + towrite, c->value, c->value_size);
             }
@@ -412,7 +421,7 @@ static void write_ascii_set_to_client(void *arg) {
     vecs[0].iov_len  = sprintf(c->wbuf, "set %s%llu 0 0 %d\r\n", c->key_prefix,
         (unsigned long long)*c->cur_key, c->value_size);
     if (c->value[0] == '\0') {
-        vecs[1].iov_base = shared_value;
+        vecs[1].iov_base = c->t->shared_value;
     } else {
         vecs[1].iov_base = c->value;
     }
@@ -464,7 +473,7 @@ static void read_from_client(void *arg) {
     struct connection *c = arg;
     int rbytes = 0;
     for (;;) {
-        rbytes = read(c->fd, shared_rbuf, 1024 * 32);
+        rbytes = read(c->fd, c->t->shared_rbuf, 1024 * 32);
         if (rbytes == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -550,7 +559,7 @@ static int new_connection(struct connection *t)
     c->ev_flags = EV_WRITE;
 
     event_set(&c->ev, sock, c->ev_flags, client_handler, (void *)c);
-    event_base_set(main_base, &c->ev);
+    event_base_set(c->t->base, &c->ev);
     event_add(&c->ev, NULL);
 
     if (c->iov_count > 0) {
@@ -663,7 +672,7 @@ static void prealloc_keys(struct connection *t, int add_space) {
 }
 
 /* Get a little verbose to avoid a big if/else if tree */
-static void parse_config_line(char *line) {
+static void parse_config_line(mc_thread *main_thread, char *line) {
     char *in_progress, *token;
     struct connection template;
     int conns_tomake = 1;
@@ -672,6 +681,7 @@ static void parse_config_line(char *line) {
     char *tmp;
     char *sender = NULL;
     int add_space = 0;
+    int new_thread = 0;
 
     enum {
         SEND = 0,
@@ -694,7 +704,8 @@ static void parse_config_line(char *line) {
         KEY_COUNT,
         KEY_PREALLOC,
         HOST,
-        PORT
+        PORT,
+        THREAD
     };
 
     char *const key_options[] = {
@@ -719,12 +730,15 @@ static void parse_config_line(char *line) {
         [KEY_PREALLOC]     = "key_prealloc",
         [HOST]             = "host",
         [PORT]             = "port",
+        [THREAD]           = "thread",
         NULL
     };
+
 
     memset(&template, 0, sizeof(struct connection));
     /* Set defaults into template */
     strcpy(template.key_prefix, "foo");
+    template.t = main_thread;
     template.mget_count = 2;
     template.value_size = 2;
     template.value[0] = '\0';
@@ -796,6 +810,11 @@ static void parse_config_line(char *line) {
         case PORT:
             template.port_num = atoi(value);
             break;
+        case THREAD:
+            template.t = calloc(1, sizeof(mc_thread));
+            setup_thread(template.t);
+            new_thread = 1;
+            break;
         }
     }
 
@@ -815,7 +834,7 @@ static void parse_config_line(char *line) {
             template.writer = prealloc_write_ascii_decr_to_client;
             template.iov_count = 3;
         } else {
-            fprintf(stderr, "Unknown command writer: %s\n", sender);
+            fprintf(stderr, "Unknown prealloc command writer: %s\n", sender);
             exit(1);
         }
         prealloc_keys(&template, add_space);
@@ -848,18 +867,48 @@ static void parse_config_line(char *line) {
     for (i = 0; i < conns_tomake; i++) {
         newsock = new_connection(&template);
     }
+    if (new_thread) {
+        create_thread(template.t);
+    }
+}
+
+static void *thread_runner(void *arg) {
+    mc_thread *t = arg;
+    event_base_loop(t->base, 0);
+    fprintf(stderr, "Thread exiting\n");
+    return NULL;
+}
+
+static void setup_thread(mc_thread *t) {
+    t->base = event_init();
+    if (!t->base) {
+        fprintf(stderr, "Cannot allocate event base\n");
+        exit(1);
+    }
+
+    t->shared_value = calloc(SHARED_VALUE_SIZE, sizeof(unsigned char));
+    t->shared_rbuf = calloc(SHARED_RBUF_SIZE, sizeof(unsigned char));
+}
+
+static void create_thread(mc_thread *t) {
+    pthread_attr_t attr;
+    int ret;
+
+    pthread_attr_init(&attr);
+    if ((ret = pthread_create(&t->thread_id, &attr, thread_runner, t)) != 0) {
+        fprintf(stderr, "Cannot create thread: %s\n", strerror(ret));
+        exit(1);
+    }
 }
 
 int main(int argc, char **argv)
 {
     FILE *cfd;
     char line[4096];
-    counter = 1;
-    reset_counter_after = 200000;
+    mc_thread *main_thread = NULL;
+    main_thread = calloc(1, sizeof(mc_thread));
+    setup_thread(main_thread);
 
-    shared_value = calloc(1024 * 1024, sizeof(unsigned char));
-
-    main_base = event_init();
     if (argc > 2) {
         strncpy(ip_addr_default, argv[2], 60);
         printf("ip address default: %s\n", ip_addr_default);
@@ -876,8 +925,10 @@ int main(int argc, char **argv)
     }
 
     while (fgets(line, 4096, cfd) != NULL) {
-        parse_config_line(line);
+        parse_config_line(main_thread, line);
     }
 
-    event_base_loop(main_base, 0);
+    create_thread(main_thread);
+    pthread_join(main_thread->thread_id, NULL);
+    return 0;
 }
