@@ -68,9 +68,7 @@ struct connection {
     enum conn_states state;
     short ev_flags;
 
-    /* Counters, bits, flags for individual senders/getters .
-     * This isn't a union because who gives a shit.
-     */
+    /* Counters, bits, flags for individual senders/getters. */
     int mget_count;                /* # of ascii mget keys to send at once */
     unsigned char key_prefix[240];
     int value_size;
@@ -577,7 +575,6 @@ static void init_bin_get(struct connection *t) {
 }
 
 static void init_bin_getq(struct connection *t) {
-    /* lulz */
     init_bin_get(t);
     t->bin_get_pkt.message.header.request.opcode = PROTOCOL_BINARY_CMD_GETQ;
 }
