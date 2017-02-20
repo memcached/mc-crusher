@@ -1,1 +1,1 @@
-send=ascii_get,recv=blind_read,conns=50,key_prefix=foobar,key_prealloc=1
+send=ascii_get,recv=blind_read,conns=50,key_prefix=foobar,key_prealloc=1,pipelines=8

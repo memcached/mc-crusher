@@ -90,16 +90,19 @@ struct connection {
     protocol_binary_request_set bin_set_pkt;
 
     /* Buffers */
+    uint64_t pipelines; /* number of repeated commands per write */
     uint64_t key_count;
     uint64_t key_randomize;
     uint64_t *cur_key;
     int      key_prealloc;
     struct mc_key *keys;
     unsigned char wbuf[65536];
+    unsigned char *wbuf_pos;
 
     /* iovectors */
     struct iovec *vecs;
-    int    iov_count; /* iovecs in use */
+    int    iov_used; /* iovecs used so far */
+    int    iov_count; /* iovecs in total */
     int    iov_towrite; /* bytes to write */
 
     /* reader/writer function pointers */
@@ -402,15 +405,25 @@ static void write_ascii_get_to_client(void *arg) {
 static void prealloc_write_ascii_get_to_client(void *arg) {
     struct connection *c = arg;
     struct iovec *vecs = c->vecs;
-    vecs[0].iov_base = "get ";
-    vecs[0].iov_len = 4;
-    vecs[1].iov_base = c->keys[*c->cur_key].key;
-    vecs[1].iov_len  = c->keys[*c->cur_key].key_len;
-    vecs[2].iov_base = "\r\n";
-    vecs[2].iov_len = 2;
+    int i = c->iov_used;
+    vecs[i].iov_base = "get ";
+    vecs[i].iov_len = 4;
+    i++;
+    if (c->key_prealloc) {
+        vecs[i].iov_base = c->keys[*c->cur_key].key;
+        vecs[i].iov_len  = c->keys[*c->cur_key].key_len;
+    } else {
+        vecs[i].iov_base = c->wbuf_pos;
+        vecs[i].iov_len = sprintf(c->wbuf_pos, "%s%llu",
+                                   c->key_prefix, (unsigned long long)*c->cur_key);
+        c->wbuf_pos += vecs[i].iov_len;
+    }
+    i++;
+    vecs[i].iov_base = "\r\n";
+    vecs[i].iov_len = 2;
+    i++;
+    c->iov_used += 3;
 
-    c->iov_towrite = sum_iovecs(vecs, c->iov_count);
-    write_iovecs(c, conn_reading);
     run_counter(c);
 }
 
@@ -486,6 +499,17 @@ static void read_from_client(void *arg) {
     }
 }
 
+static inline void run_write(struct connection *c) {
+    int i;
+    c->wbuf_pos = c->wbuf;
+    c->iov_used = 0;
+    for (i = 0; i < c->pipelines; i++) {
+        c->writer(c);
+    }
+    c->iov_towrite = sum_iovecs(c->vecs, c->iov_used);
+    write_iovecs(c, conn_reading);
+}
+
 static void client_handler(const int fd, const short which, void *arg) {
     struct connection *c = (struct connection *)arg;
     int err = 0;
@@ -505,20 +529,21 @@ static void client_handler(const int fd, const short which, void *arg) {
     case conn_sending:
         if (which & EV_READ) {
             c->reader(c);
-        } 
+        }
         if (which & EV_WRITE) {
             if (c->iov_towrite > 0)
                 /* FIXME: Need to cuddle this from the writer or somefuck. */
                 write_iovecs(c, conn_reading);
-            if (c->iov_towrite <= 0)
-                c->writer(c);
+            if (c->iov_towrite <= 0) {
+                run_write(c);
+            }
         }
         break;
     case conn_reading:
         c->reader(c);
         c->state = conn_sending;
         if (c->iov_towrite <= 0)
-            c->writer(c);
+            run_write(c);
         break;
     }
 }
@@ -705,7 +730,8 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         KEY_PREALLOC,
         HOST,
         PORT,
-        THREAD
+        THREAD,
+        PIPELINES
     };
 
     char *const key_options[] = {
@@ -731,6 +757,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         [HOST]             = "host",
         [PORT]             = "port",
         [THREAD]           = "thread",
+        [PIPELINES]        = "pipelines",
         NULL
     };
 
@@ -746,6 +773,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     template.key_count = 200000;
     template.key_randomize = 0;
     template.key_prealloc = 1;
+    template.pipelines = 1;
     strcpy(template.ip_addr, ip_addr_default);
     template.port_num = port_num_default;
     template.cur_key = (uint64_t *)malloc(sizeof(uint64_t));
@@ -815,30 +843,30 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
             setup_thread(template.t);
             new_thread = 1;
             break;
+        case PIPELINES:
+            template.pipelines = atoi(value);
+            break;
         }
     }
 
-    /* Gross double tree. Hey, it's string parsing in C! */
-    if (template.key_prealloc) {
-        if (strcmp(sender, "ascii_get") == 0) {
-            template.writer = prealloc_write_ascii_get_to_client;
-            template.iov_count = 3;
-        } else if (strcmp(sender, "ascii_mget") == 0) {
-            template.writer = prealloc_write_ascii_mget_to_client;
-            template.iov_count = template.mget_count + 2;
-            add_space = 1;
-        } else if (strcmp(sender, "ascii_incr") == 0) {
-            template.writer = prealloc_write_ascii_incr_to_client;
-            template.iov_count = 3;
-        } else if (strcmp(sender, "ascii_decr") == 0) {
-            template.writer = prealloc_write_ascii_decr_to_client;
-            template.iov_count = 3;
-        } else {
-            fprintf(stderr, "Unknown prealloc command writer: %s\n", sender);
-            exit(1);
-        }
-        prealloc_keys(&template, add_space);
+    if (strcmp(sender, "ascii_get") == 0) {
+        template.writer = prealloc_write_ascii_get_to_client;
+        template.iov_count = 3;
+    } else if (strcmp(sender, "ascii_mget") == 0) {
+        template.writer = prealloc_write_ascii_mget_to_client;
+        template.iov_count = template.mget_count + 2;
+        add_space = 1;
+    } else if (strcmp(sender, "ascii_incr") == 0) {
+        template.writer = prealloc_write_ascii_incr_to_client;
+        template.iov_count = 3;
+    } else if (strcmp(sender, "ascii_decr") == 0) {
+        template.writer = prealloc_write_ascii_decr_to_client;
+        template.iov_count = 3;
     } else {
+        fprintf(stderr, "Unknown command writer: %s\n", sender);
+        exit(1);
+    }
+    /*} else {
         if (strcmp(sender, "ascii_set") == 0) {
             template.writer = write_ascii_set_to_client;
             template.iov_count = 3;
@@ -862,7 +890,12 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
             fprintf(stderr, "Unknown command writer: %s\n", sender);
             exit(1);
         }
+    }*/
+
+    if (template.key_prealloc) {
+        prealloc_keys(&template, add_space);
     }
+    template.iov_count = template.iov_count * template.pipelines;
 
     for (i = 0; i < conns_tomake; i++) {
         newsock = new_connection(&template);
