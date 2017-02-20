@@ -108,6 +108,10 @@ struct connection {
     /* reader/writer function pointers */
     void (*writer)(void *arg);
     void (*reader)(void *arg);
+
+    /* helper function specific to the generic ascii writer */
+    int (*ascii_format)(struct connection *c);
+    int (*prealloc_format)(struct connection *c);
 };
 
 static void client_handler(const int fd, const short which, void *arg);
@@ -358,129 +362,74 @@ static void write_bin_setq_to_client(void *arg) {
     return;
 }
 
-static void write_ascii_mget_to_client(void *arg) {
-    struct connection *c = arg;
-    int wbytes = 0;
-    int written = 0;
-    int i;
-    strcpy(c->wbuf, "get ");
-    written += 4;
-    for (i = 0; i < c->mget_count; i++) {
-        written += sprintf(c->wbuf + written, "%s%llu ",
-            c->key_prefix, (unsigned long long)*c->cur_key);
-        run_counter(c);
-    }
-    strcpy(c->wbuf + (written), "\r\n");
-    wbytes = send(c->fd, &c->wbuf, written + 2, 0);
-    c->state = conn_reading;
+/* === ASCII PROTOCOL TESTS === */
+
+static int ascii_mget_format(struct connection *c) {
+    return sprintf(c->wbuf_pos, "%s%llu ", c->key_prefix,
+            (unsigned long long)*c->cur_key);
 }
 
-static void prealloc_write_ascii_mget_to_client(void *arg) {
+/* Multigets have a weird/specific format. */
+static void ascii_write_mget_to_client(void *arg) {
     struct connection *c = arg;
     int i;
     struct iovec *vecs = c->vecs;
     vecs[0].iov_base = "get ";
     vecs[0].iov_len  = 4;
     for (i = 1; i < c->mget_count + 1; i++) {
-        vecs[i].iov_base = c->keys[*c->cur_key].key;
-        vecs[i].iov_len  = c->keys[*c->cur_key].key_len;
+        if (c->key_prealloc) {
+            vecs[i].iov_base = c->keys[*c->cur_key].key;
+            vecs[i].iov_len  = c->keys[*c->cur_key].key_len;
+        } else {
+            vecs[i].iov_base = c->wbuf_pos;
+            vecs[i].iov_len  = ascii_mget_format(c);
+        }
         run_counter(c);
     }
     vecs[i].iov_base = "\r\n";
     vecs[i].iov_len  = 2;
-    c->iov_towrite = sum_iovecs(vecs, c->iov_count);
-    write_iovecs(c, conn_reading);
 }
 
-static void write_ascii_get_to_client(void *arg) {
-    struct connection *c = arg;
-    int wbytes = 0;
-    sprintf(c->wbuf, "get %s%llu\r\n", c->key_prefix,
-        (unsigned long long)*c->cur_key);
-    wbytes = send(c->fd, &c->wbuf, strlen(c->wbuf), 0);
-    c->state = conn_reading;
-    run_counter(c);
+static int ascii_set_format(struct connection *c) {
+    int ret = 0;
+    ret = sprintf(c->wbuf_pos, "set %s%llu 0 0 %d\r\n", c->key_prefix,
+            (unsigned long long)*c->cur_key, c->value_size);
+    memcpy(c->wbuf_pos + ret, c->value, c->value_size);
+    memcpy(c->wbuf_pos + ret + c->value_size, "\r\n", 2);
+    return ret + c->value_size + 2;
 }
 
-static void prealloc_write_ascii_get_to_client(void *arg) {
+static int ascii_incr_format(struct connection *c) {
+    return sprintf(c->wbuf_pos, "incr %s%llu 1\r\n", c->key_prefix,
+                (unsigned long long)*c->cur_key);
+}
+
+static int ascii_decr_format(struct connection *c) {
+    return sprintf(c->wbuf_pos, "decr %s%llu 1\r\n", c->key_prefix,
+                (unsigned long long)*c->cur_key);
+}
+
+static int ascii_get_format(struct connection *c) {
+    return sprintf(c->wbuf_pos, "get %s%llu\r\n", c->key_prefix,
+                (unsigned long long)*c->cur_key);
+}
+
+static void ascii_write_to_client(void *arg) {
     struct connection *c = arg;
     struct iovec *vecs = c->vecs;
-    int i = c->iov_used;
-    vecs[i].iov_base = "get ";
-    vecs[i].iov_len = 4;
-    i++;
     if (c->key_prealloc) {
-        vecs[i].iov_base = c->keys[*c->cur_key].key;
-        vecs[i].iov_len  = c->keys[*c->cur_key].key_len;
+        vecs[c->iov_used].iov_base = c->keys[*c->cur_key].key;
+        vecs[c->iov_used].iov_len  = c->keys[*c->cur_key].key_len;
     } else {
-        vecs[i].iov_base = c->wbuf_pos;
-        vecs[i].iov_len = sprintf(c->wbuf_pos, "%s%llu",
-                                   c->key_prefix, (unsigned long long)*c->cur_key);
-        c->wbuf_pos += vecs[i].iov_len;
+        vecs[c->iov_used].iov_base = c->wbuf_pos;
+        vecs[c->iov_used].iov_len = c->ascii_format(c);
+        c->wbuf_pos += vecs[c->iov_used].iov_len;
     }
-    i++;
-    vecs[i].iov_base = "\r\n";
-    vecs[i].iov_len = 2;
-    i++;
-    c->iov_used += 3;
-
+    c->iov_used++;
     run_counter(c);
 }
 
-static void write_ascii_set_to_client(void *arg) {
-    struct connection *c = arg;
-    struct iovec *vecs = c->vecs;
-    vecs[0].iov_base = c->wbuf;
-    vecs[0].iov_len  = sprintf(c->wbuf, "set %s%llu 0 0 %d\r\n", c->key_prefix,
-        (unsigned long long)*c->cur_key, c->value_size);
-    if (c->value[0] == '\0') {
-        vecs[1].iov_base = c->t->shared_value;
-    } else {
-        vecs[1].iov_base = c->value;
-    }
-    vecs[1].iov_len  = c->value_size;
-    vecs[2].iov_base = "\r\n";
-    vecs[2].iov_len  = 2;
-    c->iov_towrite = sum_iovecs(vecs, c->iov_count);
-    write_iovecs(c, conn_reading);
-
-    run_counter(c);
-}
-
-/* TODO: Add a prealloc'ed ascii set. This is difficult since the whole header
- * kinda needs to be pre-alloc'ed. So first extend the prealloc function to do
- * more formats
- */
-
-static void prealloc_write_ascii_incr_to_client(void *arg) {
-    struct connection *c = arg;
-    struct iovec *vecs = c->vecs;
-    vecs[0].iov_base = "incr ";
-    vecs[0].iov_len = 5;
-    vecs[1].iov_base = c->keys[*c->cur_key].key;
-    vecs[1].iov_len  = c->keys[*c->cur_key].key_len;
-    vecs[2].iov_base = " 1\r\n";
-    vecs[2].iov_len = 4;
-
-    c->iov_towrite = sum_iovecs(vecs, c->iov_count);
-    write_iovecs(c, conn_reading);
-    run_counter(c);
-}
-
-static void prealloc_write_ascii_decr_to_client(void *arg) {
-    struct connection *c = arg;
-    struct iovec *vecs = c->vecs;
-    vecs[0].iov_base = "decr ";
-    vecs[0].iov_len = 5;
-    vecs[1].iov_base = c->keys[*c->cur_key].key;
-    vecs[1].iov_len  = c->keys[*c->cur_key].key_len;
-    vecs[2].iov_base = " 1\r\n";
-    vecs[2].iov_len = 4;
-
-    c->iov_towrite = sum_iovecs(vecs, c->iov_count);
-    write_iovecs(c, conn_reading);
-    run_counter(c);
-}
+/* === READERS === */
 
 static void read_from_client(void *arg) {
     struct connection *c = arg;
@@ -498,6 +447,8 @@ static void read_from_client(void *arg) {
             break; /* don't call read() again unless we may get data */
     }
 }
+
+/* === HANDLERS === */
 
 static inline void run_write(struct connection *c) {
     int i;
@@ -631,7 +582,7 @@ static void init_bin_setq(struct connection *t) {
     t->bin_set_pkt.message.header.request.opcode = PROTOCOL_BINARY_CMD_SETQ;
 }
 
-static void prealloc_keys(struct connection *t, int add_space) {
+static void prealloc_keys(struct connection *t) {
     /* This "leaks" the blob on purpose. Also temporary hardcoded rough key
      * length is used. 
      */
@@ -646,30 +597,28 @@ static void prealloc_keys(struct connection *t, int add_space) {
     long int rand_two;
     char *fmt;
 
-    if (add_space == 1) {
-        fmt = "%s%llu ";
-    } else {
-        fmt = "%s%llu";
-    }
-
     /* Generate the blobs and key list */
-    key_blob = calloc(t->key_count, 30);
+    key_blob = calloc(t->key_count, 60);
     keys     = calloc(t->key_count, sizeof(struct mc_key));
     if (key_blob == NULL || keys == NULL) {
         perror("Mallocing key prealloc");
         exit(1);
     }
     key_blob_ptr = key_blob;
-    fprintf(stdout, "Prealloc memory: %llu + %llu\n", (unsigned long long)(t->key_count) * 30,
+    fprintf(stdout, "Prealloc memory: %llu + %llu\n", (unsigned long long)(t->key_count) * 60,
         (unsigned long long)sizeof(struct mc_key) * (t->key_count));
 
+    // Make the formatter think it's writing into wbuf.
+    t->wbuf_pos = key_blob_ptr;
     for (i = 0; i < t->key_count; i++) {
-        len = sprintf(key_blob_ptr, fmt, t->key_prefix,
-            (unsigned long long)i);
-        keys[i].key     = key_blob_ptr;
+        len = t->prealloc_format(t);
+        keys[i].key     = t->wbuf_pos;
         keys[i].key_len = len;
-        key_blob_ptr   += len;
+        t->wbuf_pos    += len;
+        run_counter(t);
     }
+    t->wbuf_pos = t->wbuf;
+    *t->cur_key = 0;
 
     t->keys = keys;
 
@@ -849,19 +798,23 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         }
     }
 
+    template.iov_count = 1;
     if (strcmp(sender, "ascii_get") == 0) {
-        template.writer = prealloc_write_ascii_get_to_client;
-        template.iov_count = 3;
+        template.writer = ascii_write_to_client;
+        template.ascii_format = ascii_get_format;
+    } else if (strcmp(sender, "ascii_set") == 0) {
+        template.writer = ascii_write_to_client;
+        template.ascii_format = ascii_set_format;
     } else if (strcmp(sender, "ascii_mget") == 0) {
-        template.writer = prealloc_write_ascii_mget_to_client;
+        template.writer = ascii_write_mget_to_client;
         template.iov_count = template.mget_count + 2;
-        add_space = 1;
+        template.prealloc_format = ascii_mget_format;
     } else if (strcmp(sender, "ascii_incr") == 0) {
-        template.writer = prealloc_write_ascii_incr_to_client;
-        template.iov_count = 3;
+        template.writer = ascii_write_to_client;
+        template.ascii_format = ascii_incr_format;
     } else if (strcmp(sender, "ascii_decr") == 0) {
-        template.writer = prealloc_write_ascii_decr_to_client;
-        template.iov_count = 3;
+        template.writer = ascii_write_to_client;
+        template.ascii_format = ascii_decr_format;
     } else {
         fprintf(stderr, "Unknown command writer: %s\n", sender);
         exit(1);
@@ -893,7 +846,10 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     }*/
 
     if (template.key_prealloc) {
-        prealloc_keys(&template, add_space);
+        if (!template.prealloc_format) {
+            template.prealloc_format = template.ascii_format;
+        }
+        prealloc_keys(&template);
     }
     template.iov_count = template.iov_count * template.pipelines;
 
