@@ -803,6 +803,7 @@ int main(int argc, char **argv)
     while (fgets(line, 4096, cfd) != NULL) {
         parse_config_line(main_thread, line);
     }
+    fclose(cfd);
 
     create_thread(main_thread);
     pthread_join(main_thread->thread_id, NULL);
