@@ -153,6 +153,7 @@ static void write_iovecs(struct connection *c, enum conn_states next_state) {
     written = writev(c->fd, c->vecs, c->iov_count);
     if (written == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
             c->state = conn_reading;
             return;
         } else {
@@ -363,7 +364,7 @@ static void read_from_client(void *arg) {
                 perror("Read error from client");
             }
         }
-        if (rbytes < 4095)
+        if (rbytes < 2096)
             break; /* don't call read() again unless we may get data */
     }
 }
@@ -403,7 +404,7 @@ static void client_handler(const int fd, const short which, void *arg) {
         }
         if (which & EV_WRITE) {
             if (c->iov_towrite > 0)
-                /* FIXME: Need to cuddle this from the writer or somefuck. */
+                /* FIXME: Create a c->next_state or similar */
                 write_iovecs(c, conn_reading);
             if (c->iov_towrite <= 0) {
                 run_write(c);
