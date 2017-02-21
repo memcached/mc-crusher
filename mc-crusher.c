@@ -75,6 +75,7 @@ struct connection {
     int fd;
     struct event ev;
     enum conn_states state;
+    enum conn_states next_state;
     short ev_flags;
 
     /* Counters, bits, flags for individual senders/getters. */
@@ -154,7 +155,8 @@ static void write_iovecs(struct connection *c, enum conn_states next_state) {
     if (written == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
-            c->state = conn_reading;
+            // the sender always checks for reads. not necessary to change?
+            //c->state = conn_reading;
             return;
         } else {
             perror("Write error to client");
@@ -173,6 +175,8 @@ static void write_iovecs(struct connection *c, enum conn_states next_state) {
         c->state = next_state;
         if (c->state == conn_reading) {
             update_conn_event(c, EV_READ | EV_PERSIST);
+        } else if (c->state == conn_sending) {
+            update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
         }
     }
 }
@@ -245,14 +249,14 @@ static void bin_prep_setq(struct connection *c) {
     protocol_binary_request_get *pkt = (protocol_binary_request_get *)c->wbuf_pos;
     bin_prep_set(c);
     pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_SETQ;
+    // Continue to send since we don't expect to read anything.
+    c->next_state = conn_sending;
 }
 
 /* Unhappy with this, but it's still shorter/better than the old code.
  * Binprot is just unwieldy in C, or I haven't figured out how to use it
  * simply yet.
  */
-/* FIXME: There's a bug when setting a large pipeline count (20-50) for
- * binprot commands (could be others too). Connections seem to die off. */
 /* FIXME: SETQ doesn't work since it needs to stay in sending mode post-write,
  * and the top level writer is hardcoded to swap to reader right now. */
 static void bin_write_to_client(void *arg) {
@@ -379,7 +383,7 @@ static inline void run_write(struct connection *c) {
         c->writer(c);
     }
     c->iov_towrite = sum_iovecs(c->vecs, c->iov_used);
-    write_iovecs(c, conn_reading);
+    write_iovecs(c, c->next_state);
 }
 
 static void client_handler(const int fd, const short which, void *arg) {
@@ -405,7 +409,7 @@ static void client_handler(const int fd, const short which, void *arg) {
         if (which & EV_WRITE) {
             if (c->iov_towrite > 0)
                 /* FIXME: Create a c->next_state or similar */
-                write_iovecs(c, conn_reading);
+                write_iovecs(c, c->next_state);
             if (c->iov_towrite <= 0) {
                 run_write(c);
             }
@@ -613,6 +617,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     template.pipelines = 1;
     strcpy(template.ip_addr, ip_addr_default);
     template.port_num = port_num_default;
+    template.next_state = conn_reading;
     template.cur_key = (uint64_t *)malloc(sizeof(uint64_t));
     *template.cur_key = 0;
 
