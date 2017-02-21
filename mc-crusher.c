@@ -85,10 +85,6 @@ struct connection {
     int buf_written;
     int buf_towrite;
 
-    /* Binprot headers */
-    protocol_binary_request_get bin_get_pkt;
-    protocol_binary_request_set bin_set_pkt;
-
     /* Buffers */
     uint64_t pipelines; /* number of repeated commands per write */
     uint64_t key_count;
@@ -111,6 +107,8 @@ struct connection {
 
     /* helper function specific to the generic ascii writer */
     int (*ascii_format)(struct connection *c);
+    int (*bin_format)(struct connection *c);
+    void (*bin_prep_cmd)(struct connection *c);
     int (*prealloc_format)(struct connection *c);
 };
 
@@ -194,172 +192,94 @@ static inline void run_counter(struct connection *c) {
     }
 }
 
-static void write_bin_get_to_client(void *arg) {
-    struct connection *c = arg;
-    int wbytes = 0;
-    uint32_t keylen = 0;
+/* === BINARY PROTOCOL === */
 
-    keylen = sprintf(c->wbuf + sizeof(c->bin_get_pkt), "%s%llu", c->key_prefix,
-        (unsigned long long)*c->cur_key);
-    c->bin_get_pkt.message.header.request.keylen = htons(keylen);
-    c->bin_get_pkt.message.header.request.bodylen = htonl(keylen);
-    memcpy(c->wbuf, (char *)&c->bin_get_pkt.bytes, sizeof(c->bin_get_pkt));
-    wbytes = send(c->fd, c->wbuf, sizeof(c->bin_get_pkt) + keylen, 0);
-    c->state = conn_reading;
-    run_counter(c);
+static int bin_key_format(struct connection *c) {
+    return sprintf(c->wbuf_pos, "%s%llu", c->key_prefix,
+            (unsigned long long)*c->cur_key);
 }
 
-static void write_bin_getq_to_client(void *arg) {
-    struct connection *c = arg;
-    int wbytes = 0;
-    uint32_t keylen = 0;
-    int towrite = 0;
-    size_t psize = sizeof(c->bin_get_pkt);
+// can generalize this a bit further.
+static void bin_prep_getq(struct connection *c) {
+    protocol_binary_request_get *pkt = (protocol_binary_request_get *)c->wbuf_pos;
+    pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_GETQ;
 
-    /* existing buffer we need to finish flushing */
-    if (c->buf_towrite) {
-        wbytes = send(c->fd, c->wbuf + c->buf_written, c->buf_towrite, 0);
-        if (wbytes == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                c->state = conn_reading;
-                return;
-            } else {
-                perror("Early write error to client");
-                return;
-            }
-        } else if (wbytes < c->buf_towrite) {
-            c->state = conn_reading;
-            c->buf_towrite -= wbytes;
-            c->buf_written += wbytes;
-            return;
-        }
-        c->buf_towrite = 0;
-        c->buf_written = 0;
-    }
-
-    for(;;) {
-        towrite = 0;
-        while (towrite < (4096 - (psize + 250))) {
-            keylen = sprintf(c->wbuf + towrite + psize, "%s%llu",
-                c->key_prefix, (unsigned long long)*c->cur_key);
-            c->bin_get_pkt.message.header.request.keylen = htons(keylen);
-            c->bin_get_pkt.message.header.request.bodylen = htonl(keylen);
-            memcpy(c->wbuf + towrite, (char *)&c->bin_get_pkt.bytes, psize);
-            towrite += keylen + psize;
-            run_counter(c);
-        }
-        wbytes = send(c->fd, c->wbuf, towrite, 0);
-        if (wbytes == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                c->state = conn_reading;
-                c->buf_towrite = towrite;
-                return;
-            } else {
-                perror("Late write error to client");
-                return;
-            }
-        } else if (wbytes < towrite) {
-            c->state = conn_reading;
-            c->buf_towrite = towrite - wbytes;
-            c->buf_written = wbytes;
-            return;
-        }
-    }
-
-    return;
+    struct iovec *vecs = c->vecs;
+    int i = c->iov_used;
+    vecs[i].iov_base = c->wbuf_pos;
+    vecs[i].iov_len  = sizeof(protocol_binary_request_get);
+    c->wbuf_pos += vecs[i].iov_len;
+    c->iov_used++;
 }
 
-static void write_bin_set_to_client(void *arg) {
-    struct connection *c = arg;
-    int wbytes = 0;
-    uint32_t keylen = 0;
+static void bin_prep_get(struct connection *c) {
+    protocol_binary_request_get *pkt = (protocol_binary_request_get *)c->wbuf_pos;
+    pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_GET;
 
-    keylen = sprintf(c->wbuf + sizeof(c->bin_set_pkt), "%s%llu", c->key_prefix,
-        (unsigned long long)*c->cur_key);
-    c->bin_set_pkt.message.header.request.keylen = htons(keylen);
-    c->bin_set_pkt.message.header.request.bodylen = htonl(keylen +
-        c->value_size + 8);
-    memcpy(c->wbuf, (char *)&c->bin_set_pkt.bytes, sizeof(c->bin_set_pkt));
-    wbytes = send(c->fd, c->wbuf, sizeof(c->bin_set_pkt) + keylen, 0);
-    if (c->value[0] == '\0') {
-        wbytes = send(c->fd, c->t->shared_value, c->value_size, 0);
+    struct iovec *vecs = c->vecs;
+    int i = c->iov_used;
+    vecs[i].iov_base = c->wbuf_pos;
+    vecs[i].iov_len  = sizeof(protocol_binary_request_get);
+    c->wbuf_pos += vecs[i].iov_len;
+    c->iov_used++;
+}
+
+static void bin_prep_set(struct connection *c) {
+    protocol_binary_request_get *pkt = (protocol_binary_request_get *)c->wbuf_pos;
+    pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_SET;
+    pkt->message.header.request.extlen = 8; /* flags + exptime */
+
+    struct iovec *vecs = c->vecs;
+    int i = c->iov_used;
+    vecs[i].iov_base = c->wbuf_pos;
+    vecs[i].iov_len  = sizeof(protocol_binary_request_set);
+    c->wbuf_pos += vecs[i].iov_len;
+    c->iov_used++;
+}
+
+/* slightly crazy; since bin_prep_set changes wbuf_pos create the packet
+ * pointer first, run original prep, then switch the command out.
+ */
+static void bin_prep_setq(struct connection *c) {
+    protocol_binary_request_get *pkt = (protocol_binary_request_get *)c->wbuf_pos;
+    bin_prep_set(c);
+    pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_SETQ;
+}
+
+/* Unhappy with this, but it's still shorter/better than the old code.
+ * Binprot is just unwieldy in C, or I haven't figured out how to use it
+ * simply yet.
+ */
+/* FIXME: There's a bug when setting a large pipeline count (20-50) for
+ * binprot commands (could be others too). Connections seem to die off. */
+/* FIXME: SETQ doesn't work since it needs to stay in sending mode post-write,
+ * and the top level writer is hardcoded to swap to reader right now. */
+static void bin_write_to_client(void *arg) {
+    struct connection *c = arg;
+    struct iovec *vecs = c->vecs;
+    protocol_binary_request_header *pkt = (protocol_binary_request_header *)c->wbuf_pos;
+    memset(pkt, 0, sizeof(protocol_binary_request_header));
+    pkt->request.magic = PROTOCOL_BINARY_REQ;
+    c->bin_prep_cmd(c);
+    if (c->key_prealloc) {
+        vecs[c->iov_used].iov_base = c->keys[*c->cur_key].key;
+        vecs[c->iov_used].iov_len  = c->keys[*c->cur_key].key_len;
     } else {
-        wbytes = send(c->fd, c->value, c->value_size, 0);
+        vecs[c->iov_used].iov_base = c->wbuf_pos;
+        vecs[c->iov_used].iov_len = c->bin_format(c);
+        c->wbuf_pos += vecs[c->iov_used].iov_len;
     }
-
-    c->state = conn_reading;
+    int bodylen = vecs[c->iov_used].iov_len + pkt->request.extlen;
+    pkt->request.keylen = htons(vecs[c->iov_used].iov_len);
+    c->iov_used++;
+    if (c->value_size) {
+        bodylen += c->value_size;
+        vecs[c->iov_used].iov_base = c->value;
+        vecs[c->iov_used].iov_len = c->value_size;
+        c->iov_used++;
+    }
+    pkt->request.bodylen = htonl(bodylen);
     run_counter(c);
-
-    return;
-}
-
-static void write_bin_setq_to_client(void *arg) {
-    struct connection *c = arg;
-    int wbytes = 0;
-    uint32_t keylen = 0;
-    int towrite = 0;
-    size_t psize = sizeof(c->bin_set_pkt);
-
-    update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
-    /* existing buffer we need to finish flushing */
-    if (c->buf_towrite) {
-        wbytes = send(c->fd, c->wbuf + c->buf_written, c->buf_towrite, 0);
-        if (wbytes == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                c->state = conn_sending;
-                return;
-            } else {
-                perror("Early write error to client");
-                return;
-            }
-        } else if (wbytes < c->buf_towrite) {
-            c->state = conn_reading;
-            c->buf_towrite -= wbytes;
-            c->buf_written += wbytes;
-            return;
-        }
-        c->buf_towrite = 0;
-        c->buf_written = 0;
-    }
-
-    for(;;) {
-        towrite = 0;
-        while (towrite < (4096 - (psize + 250))) {
-            keylen = sprintf(c->wbuf + towrite + psize, "%s%llu",
-                c->key_prefix, (unsigned long long)*c->cur_key);
-            c->bin_set_pkt.message.header.request.keylen = htons(keylen);
-            c->bin_set_pkt.message.header.request.bodylen = htonl(keylen + 8 +
-                c->value_size);
-            memcpy(c->wbuf + towrite, (char *)&c->bin_set_pkt.bytes, psize);
-            towrite += keylen + psize;
-            if (c->value[0] == '\0') {
-                memcpy(c->wbuf + towrite, c->t->shared_value, c->value_size);
-            } else {
-                memcpy(c->wbuf + towrite, c->value, c->value_size);
-            }
-            towrite += c->value_size;
-
-            run_counter(c);
-        }
-        wbytes = send(c->fd, c->wbuf, towrite, 0);
-        if (wbytes == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                c->state = conn_sending;
-                c->buf_towrite = towrite;
-                return;
-            } else {
-                perror("Late write error to client");
-                return;
-            }
-        } else if (wbytes < towrite) {
-            c->state = conn_sending;
-            c->buf_towrite = towrite - wbytes;
-            c->buf_written = wbytes;
-            return;
-        }
-    }
-
-    return;
 }
 
 /* === ASCII PROTOCOL TESTS === */
@@ -549,39 +469,6 @@ static int new_connection(struct connection *t)
     return sock;
 }
 
-static void init_bin_get(struct connection *t) {
-    t->bin_get_pkt.message.header.request.magic = PROTOCOL_BINARY_REQ;
-    t->bin_get_pkt.message.header.request.opcode = PROTOCOL_BINARY_CMD_GET;
-    t->bin_get_pkt.message.header.request.keylen = 0; /* init to zero */
-    t->bin_get_pkt.message.header.request.extlen = 0; /* no extras for gets */
-    t->bin_get_pkt.message.header.request.bodylen = 0; /* init to zero */
-    t->bin_get_pkt.message.header.request.opaque = 0; /* who cares */
-    t->bin_get_pkt.message.header.request.cas = 0; /* also who cares */
-}
-
-static void init_bin_getq(struct connection *t) {
-    init_bin_get(t);
-    t->bin_get_pkt.message.header.request.opcode = PROTOCOL_BINARY_CMD_GETQ;
-}
-
-static void init_bin_set(struct connection *t) {
-    t->bin_set_pkt.message.header.request.magic = PROTOCOL_BINARY_REQ;
-    t->bin_set_pkt.message.header.request.opcode = PROTOCOL_BINARY_CMD_SET;
-    t->bin_set_pkt.message.header.request.keylen = 0; /* init to zero */
-    t->bin_set_pkt.message.header.request.extlen = 8; /* flags + exptime */
-    t->bin_set_pkt.message.header.request.bodylen = 0; /* init to zero */
-    t->bin_set_pkt.message.header.request.opaque = 0; /* who cares */
-    t->bin_set_pkt.message.header.request.cas = 0; /* also who cares */
-
-    t->bin_set_pkt.message.body.flags = 0;
-    t->bin_set_pkt.message.body.expiration = 0; /* this will be an option */
-}
-
-static void init_bin_setq(struct connection *t) {
-    init_bin_set(t);
-    t->bin_set_pkt.message.header.request.opcode = PROTOCOL_BINARY_CMD_SETQ;
-}
-
 static void prealloc_keys(struct connection *t) {
     /* This "leaks" the blob on purpose. Also temporary hardcoded rough key
      * length is used. 
@@ -716,7 +603,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     strcpy(template.key_prefix, "foo");
     template.t = main_thread;
     template.mget_count = 2;
-    template.value_size = 2;
+    template.value_size = 0;
     template.value[0] = '\0';
     template.buf_written = 0;
     template.key_count = 200000;
@@ -815,35 +702,34 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     } else if (strcmp(sender, "ascii_decr") == 0) {
         template.writer = ascii_write_to_client;
         template.ascii_format = ascii_decr_format;
+    } else if (strcmp(sender, "bin_get") == 0) {
+        template.writer = bin_write_to_client;
+        template.bin_prep_cmd = bin_prep_get;
+        template.bin_format = bin_key_format;
+        template.prealloc_format = bin_key_format;
+        template.iov_count = 2;
+    } else if (strcmp(sender, "bin_getq") == 0) {
+        template.writer = bin_write_to_client;
+        template.bin_prep_cmd = bin_prep_getq;
+        template.bin_format = bin_key_format;
+        template.prealloc_format = bin_key_format;
+        template.iov_count = 2;
+    } else if (strcmp(sender, "bin_set") == 0) {
+        template.writer = bin_write_to_client;
+        template.bin_prep_cmd = bin_prep_set;
+        template.bin_format = bin_key_format;
+        template.prealloc_format = bin_key_format;
+        template.iov_count = 3;
+    } else if (strcmp(sender, "bin_setq") == 0) {
+        template.writer = bin_write_to_client;
+        template.bin_prep_cmd = bin_prep_setq;
+        template.bin_format = bin_key_format;
+        template.prealloc_format = bin_key_format;
+        template.iov_count = 3;
     } else {
         fprintf(stderr, "Unknown command writer: %s\n", sender);
         exit(1);
     }
-    /*} else {
-        if (strcmp(sender, "ascii_set") == 0) {
-            template.writer = write_ascii_set_to_client;
-            template.iov_count = 3;
-        } else if (strcmp(sender, "ascii_get") == 0) {
-            template.writer = write_ascii_get_to_client;
-        } else if (strcmp(sender, "ascii_mget") == 0) {
-            template.writer = write_ascii_mget_to_client;
-        } else if (strcmp(sender, "bin_get") == 0) {
-            init_bin_get(&template);
-            template.writer = write_bin_get_to_client;
-        } else if (strcmp(sender, "bin_getq") == 0) {
-            init_bin_getq(&template);
-            template.writer = write_bin_getq_to_client;
-        } else if (strcmp(sender, "bin_set") == 0) {
-            init_bin_set(&template);
-            template.writer = write_bin_set_to_client;
-        } else if (strcmp(sender, "bin_setq") == 0) {
-            init_bin_setq(&template);
-            template.writer = write_bin_setq_to_client;
-        } else {
-            fprintf(stderr, "Unknown command writer: %s\n", sender);
-            exit(1);
-        }
-    }*/
 
     if (template.key_prealloc) {
         if (!template.prealloc_format) {
@@ -851,6 +737,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         }
         prealloc_keys(&template);
     }
+    // FIXME: Should use iov_count for prealloc, iov_used for writers.
     template.iov_count = template.iov_count * template.pipelines;
 
     for (i = 0; i < conns_tomake; i++) {
