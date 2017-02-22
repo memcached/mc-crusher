@@ -36,6 +36,7 @@
 #include <sysexits.h>
 #include <stddef.h>
 #include <sys/stat.h>
+#include <signal.h>
 
 #include "protocol_binary.h"
 
@@ -44,6 +45,7 @@
 
 char ip_addr_default[60] = "127.0.0.1";
 int port_num_default = 11211;
+int alarm_fired = 0;
 
 enum conn_states {
     conn_connecting = 0,
@@ -783,6 +785,10 @@ static void create_thread(mc_thread *t) {
     }
 }
 
+static void alarm_handler(int signal) {
+    alarm_fired = 1;
+}
+
 int main(int argc, char **argv)
 {
     FILE *cfd;
@@ -812,6 +818,23 @@ int main(int argc, char **argv)
     fclose(cfd);
 
     create_thread(main_thread);
-    pthread_join(main_thread->thread_id, NULL);
+
+    // TODO: Use a real argument parser.
+    if (argc > 4) {
+        struct sigaction sig_h;
+
+        sig_h.sa_handler = alarm_handler;
+        sig_h.sa_flags = 0;
+
+        sigaction(SIGALRM, &sig_h, NULL);
+        int timer = atoi(argv[4]);
+        fprintf(stderr, "setting a timer\n");
+        alarm(timer);
+    }
+    // TODO: Fire a signal at parent when threads exit? since they shouldn't.
+    pause();
+    if (alarm_fired) {
+        printf("timed run complete\n");
+    }
     return 0;
 }
