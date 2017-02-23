@@ -259,8 +259,6 @@ static void bin_prep_setq(struct connection *c) {
  * Binprot is just unwieldy in C, or I haven't figured out how to use it
  * simply yet.
  */
-/* FIXME: SETQ doesn't work since it needs to stay in sending mode post-write,
- * and the top level writer is hardcoded to swap to reader right now. */
 static void bin_write_to_client(void *arg) {
     struct connection *c = arg;
     struct iovec *vecs = c->vecs;
