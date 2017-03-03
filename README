@@ -31,9 +31,7 @@ and run the "sample" script that comes with mc-crusher. mc-crusher makes no
 attempt to care about what it does. It flails tiredlessly against the fanged
 defenses of the cache daemon.
 
-Modify bench-sample to print what you are most interested in examining. Start
-multiple instances of mc-crusher if you think memcached can take more. In the
-future threads will be used for user convenience.
+Modify bench-sample to print what you are most interested in examining.
 
 You can change the "default" destination ip/port by adding extra arguments:
 $ ./mc-crusher ./conf/loadconf 192.168.1.1 11211
