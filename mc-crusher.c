@@ -84,6 +84,7 @@ struct connection {
     int mget_count;                /* # of ascii mget keys to send at once */
     unsigned char key_prefix[240];
     int value_size;
+    int use_shared_value;
     unsigned char value[2048];     /* manually specified seed value */
     int buf_written;
     int buf_towrite;
@@ -279,7 +280,11 @@ static void bin_write_to_client(void *arg) {
     c->iov_used++;
     if (c->value_size) {
         bodylen += c->value_size;
-        vecs[c->iov_used].iov_base = c->value;
+        if (c->use_shared_value) {
+            vecs[c->iov_used].iov_base = c->t->shared_value;
+        } else {
+            vecs[c->iov_used].iov_base = c->value;
+        }
         vecs[c->iov_used].iov_len = c->value_size;
         c->iov_used++;
     }
@@ -319,9 +324,7 @@ static int ascii_set_format(struct connection *c) {
     int ret = 0;
     ret = sprintf(c->wbuf_pos, "set %s%llu 0 0 %d\r\n", c->key_prefix,
             (unsigned long long)*c->cur_key, c->value_size);
-    memcpy(c->wbuf_pos + ret, c->value, c->value_size);
-    memcpy(c->wbuf_pos + ret + c->value_size, "\r\n", 2);
-    return ret + c->value_size + 2;
+    return ret;
 }
 
 static int ascii_incr_format(struct connection *c) {
@@ -351,6 +354,18 @@ static void ascii_write_to_client(void *arg) {
         c->wbuf_pos += vecs[c->iov_used].iov_len;
     }
     c->iov_used++;
+    if (c->value_size) {
+        if (c->use_shared_value) {
+            vecs[c->iov_used].iov_base = c->t->shared_value;
+        } else {
+            vecs[c->iov_used].iov_base = c->value;
+        }
+        vecs[c->iov_used].iov_len = c->value_size;
+        c->iov_used++;
+        vecs[c->iov_used].iov_base = "\r\n";
+        vecs[c->iov_used].iov_len = 2;
+        c->iov_used++;
+    }
     run_counter(c);
 }
 
@@ -610,6 +625,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     template.mget_count = 2;
     template.value_size = 0;
     template.value[0] = '\0';
+    template.use_shared_value = 1;
     template.buf_written = 0;
     template.key_count = 200000;
     template.key_randomize = 0;
@@ -664,6 +680,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         case VALUE:
             strcpy(template.value, value);
             template.value_size = strlen(value);
+            template.use_shared_value = 0;
             break;
         case RANDOMIZE:
             template.key_randomize = atoi(value);
@@ -698,6 +715,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     } else if (strcmp(sender, "ascii_set") == 0) {
         template.writer = ascii_write_to_client;
         template.ascii_format = ascii_set_format;
+        template.iov_count = 3;
     } else if (strcmp(sender, "ascii_mget") == 0) {
         template.writer = ascii_write_mget_to_client;
         template.iov_count = template.mget_count + 2;
