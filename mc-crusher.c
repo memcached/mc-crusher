@@ -43,8 +43,8 @@
 #define SHARED_RBUF_SIZE 1024 * 64
 #define SHARED_VALUE_SIZE 1024 * 1024
 
-char ip_addr_default[60] = "127.0.0.1";
-int port_num_default = 11211;
+char host_default[NI_MAXHOST] = "127.0.0.1";
+char port_num_default[NI_MAXSERV] = "11211";
 int alarm_fired = 0;
 
 enum conn_states {
@@ -70,8 +70,8 @@ struct connection {
     mc_thread *t;
 
     /* host */
-    char ip_addr[60];
-    int port_num;
+    char host[NI_MAXHOST];
+    char port_num[NI_MAXSERV];
 
     /* Event stuff */
     int fd;
@@ -442,34 +442,63 @@ static void client_handler(const int fd, const short which, void *arg) {
 static int new_connection(struct connection *t)
 {
     int sock;
-    struct sockaddr_in dest_addr;
+    struct addrinfo *ai;
+    struct addrinfo *ai_next;
+    struct addrinfo hints = { .ai_flags = AI_PASSIVE,
+                              .ai_family = AF_UNSPEC };
     int flags = 1;
+    int error;
     struct connection *c = (struct connection *)malloc(sizeof(struct connection));
     memcpy(c, t, sizeof(struct connection));
 
     sock = socket(AF_INET, SOCK_STREAM, 0);
 
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(c->port_num);
-    dest_addr.sin_addr.s_addr = inet_addr(c->ip_addr);
+    error = getaddrinfo(c->host, c->port_num, &hints, &ai);
+    if (error != 0) {
+        if (error != EAI_SYSTEM) {
+            fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
+        } else {
+            perror("getaddrinfo()");
+        }
+        freeaddrinfo(ai);
+        return -1;
+    }
+
+    for (ai_next = ai; ai_next; ai_next = ai_next->ai_next) {
+        sock = socket(ai_next->ai_family, ai_next->ai_socktype, ai_next->ai_protocol);
+        if (sock == -1) {
+            perror("socket");
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    if (sock < 0) {
+        fprintf(stderr, "getaddrinfo failed to provide any valid addresses: %s[%s]\n",
+                c->host, c->port_num);
+        freeaddrinfo(ai);
+        return -1;
+    }
 
     if ( (flags = fcntl(sock, F_GETFL, 0)) < 0 ||
         fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
         close(sock);
+        freeaddrinfo(ai);
         return -1;
     }
 
-    memset(&(dest_addr.sin_zero), '\0', 8);
-
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
 
-    if (connect(sock, (const struct sockaddr *)&dest_addr, sizeof(dest_addr)) == -1) {
+    if (connect(sock, ai_next->ai_addr, ai_next->ai_addrlen) == -1) {
         if (errno != EINPROGRESS) {
             close(sock);
+            freeaddrinfo(ai);
             return -1;
         }
     }
 
+    freeaddrinfo(ai);
     c->fd = sock;
     c->state = conn_connecting;
     c->ev_flags = EV_WRITE;
@@ -631,8 +660,8 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     template.key_randomize = 0;
     template.key_prealloc = 1;
     template.pipelines = 1;
-    strcpy(template.ip_addr, ip_addr_default);
-    template.port_num = port_num_default;
+    strcpy(template.host, host_default);
+    strcpy(template.port_num, port_num_default);
     template.next_state = conn_reading;
     template.cur_key = (uint64_t *)malloc(sizeof(uint64_t));
     *template.cur_key = 0;
@@ -692,10 +721,10 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
             template.key_prealloc = atoi(value);
             break;
         case HOST:
-            strcpy(template.ip_addr, value);
+            strcpy(template.host, value);
             break;
         case PORT:
-            template.port_num = atoi(value);
+            strcpy(template.port_num, value);
             break;
         case THREAD:
             template.t = calloc(1, sizeof(mc_thread));
@@ -766,6 +795,10 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
 
     for (i = 0; i < conns_tomake; i++) {
         newsock = new_connection(&template);
+        if (newsock < 0) {
+            fprintf(stderr, "Failed to connect: %s[%s]\n", template.host, template.port_num);
+            exit(1);
+        }
     }
     if (new_thread) {
         create_thread(template.t);
@@ -814,12 +847,12 @@ int main(int argc, char **argv)
     setup_thread(main_thread);
 
     if (argc > 2) {
-        strncpy(ip_addr_default, argv[2], 60);
-        printf("ip address default: %s\n", ip_addr_default);
+        strncpy(host_default, argv[2], NI_MAXHOST);
+        printf("ip address default: %s\n", host_default);
     }
     if (argc > 3) {
-        port_num_default = atoi(argv[3]);
-        printf("port default: %d\n", port_num_default);
+        strncpy(port_num_default, argv[3], NI_MAXSERV);
+        printf("port default: %s\n", port_num_default);
     }
 
     cfd = fopen(argv[1], "r");
