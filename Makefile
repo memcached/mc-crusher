@@ -1,7 +1,10 @@
 PREFIX=/usr/local
 
 all:
-	gcc -g -O2 -pthread -o mc-crusher mc-crusher.c -levent
+	gcc -g -O2 -pthread -o mc-crusher mc-crusher.c $(LDFLAGS) -levent
+
+static:
+	gcc -g -O2 -pthread -o mc-crusher mc-crusher.c $(LDFLAGS) -Wl,-Bstatic -levent -Wl,-Bdynamic
 
 .PHONY: install
 
