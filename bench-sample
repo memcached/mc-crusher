@@ -8,6 +8,7 @@ use IO::Socket::INET;
 use Time::HiRes;
 
 my $host        = shift @ARGV;
+my $MAX_RUNS    = shift @ARGV;
 my $SAMPLE_TIME = shift @ARGV || 2;
 my @TO_SAMPLE   = @ARGV;
 unless (@TO_SAMPLE) {
@@ -22,20 +23,37 @@ $longest++;
 my $s = connect_to($host);
 die $@ unless $s;
 
-my $one      = mc_info($s);
-my $one_time = Time::HiRes::time;
+my %avgs = ();
+my $runs = 0;
 
-sleep $SAMPLE_TIME;
+while (1) {
+    sample();
+    last if ($MAX_RUNS == -1 ||
+        ($MAX_RUNS != 0 && $runs == $MAX_RUNS));
+}
 
-my $two      = mc_info($s);
-my $two_time = Time::HiRes::time;
+sub sample {
+    my $one      = mc_info($s);
+    my $one_time = Time::HiRes::time;
 
-my $elapsed = $two_time - $one_time;
+    sleep $SAMPLE_TIME;
 
-for my $stat (@TO_SAMPLE) {
-    my $per_sec = ($two->{$stat} - $one->{$stat}) / $elapsed;
-    printf "%-${longest}s avg/s (%2s/s sample): %s\n", $stat,
-        $SAMPLE_TIME, $per_sec;
+    my $two      = mc_info($s);
+    my $two_time = Time::HiRes::time;
+
+    my $elapsed = $two_time - $one_time;
+    $runs++;
+
+    for my $stat (@TO_SAMPLE) {
+        my $per_sec = ($two->{$stat} - $one->{$stat}) / $elapsed;
+        if (!$avgs{$stat}) {
+            $avgs{$stat} = $per_sec;
+        } else {
+            $avgs{$stat} += $per_sec;
+        }
+        printf "%-${longest}s avg/s (%2s/s sample): %-20s [%s]\n", $stat,
+        $SAMPLE_TIME, $per_sec, $avgs{$stat} / $runs;
+    }
 }
 
 sub mc_info {
