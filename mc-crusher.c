@@ -88,6 +88,8 @@ struct connection {
     unsigned char value[2048];     /* manually specified seed value */
     int buf_written;
     int buf_towrite;
+    uint32_t expire;
+    uint32_t flags;
 
     /* Buffers */
     uint64_t pipelines; /* number of repeated commands per write */
@@ -233,9 +235,11 @@ static void bin_prep_get(struct connection *c) {
 }
 
 static void bin_prep_set(struct connection *c) {
-    protocol_binary_request_get *pkt = (protocol_binary_request_get *)c->wbuf_pos;
+    protocol_binary_request_set *pkt = (protocol_binary_request_set *)c->wbuf_pos;
     pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_SET;
     pkt->message.header.request.extlen = 8; /* flags + exptime */
+    pkt->message.body.flags = htonl(c->flags);
+    pkt->message.body.expiration = htonl(c->expire);
 
     struct iovec *vecs = c->vecs;
     int i = c->iov_used;
@@ -249,7 +253,7 @@ static void bin_prep_set(struct connection *c) {
  * pointer first, run original prep, then switch the command out.
  */
 static void bin_prep_setq(struct connection *c) {
-    protocol_binary_request_get *pkt = (protocol_binary_request_get *)c->wbuf_pos;
+    protocol_binary_request_set *pkt = (protocol_binary_request_set *)c->wbuf_pos;
     bin_prep_set(c);
     pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_SETQ;
     // Continue to send since we don't expect to read anything.
@@ -322,8 +326,8 @@ static void ascii_write_mget_to_client(void *arg) {
 
 static int ascii_set_format(struct connection *c) {
     int ret = 0;
-    ret = sprintf(c->wbuf_pos, "set %s%llu 0 0 %d\r\n", c->key_prefix,
-            (unsigned long long)*c->cur_key, c->value_size);
+    ret = sprintf(c->wbuf_pos, "set %s%llu %u %u %d\r\n", c->key_prefix,
+            (unsigned long long)*c->cur_key, c->flags, c->expire, c->value_size);
     return ret;
 }
 
@@ -602,6 +606,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         CONNS,
         SLEEP_EVERY,
         EXPIRE,
+        FLAGS,
         KEY_PREFIX,
         KEY_LEN,
         KEY_GENERATE,
@@ -628,6 +633,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         [CONNS]            = "conns",
         [SLEEP_EVERY]      = "sleep_every",
         [EXPIRE]           = "expire",
+        [FLAGS]            = "flags",
         [KEY_PREFIX]       = "key_prefix",
         [KEY_LEN]          = "key_len",
         [KEY_GENERATE]     = "key_generate",
@@ -660,6 +666,8 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     template.key_randomize = 0;
     template.key_prealloc = 1;
     template.pipelines = 1;
+    template.expire = 0;
+    template.flags = 0;
     strcpy(template.host, host_default);
     strcpy(template.port_num, port_num_default);
     template.next_state = conn_reading;
@@ -696,6 +704,13 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
             conns_tomake = atoi(value);
             break;
         case COUNT:
+            break;
+        case EXPIRE:
+            // TODO: import strtoul wrappers
+            template.expire = atoi(value);
+            break;
+        case FLAGS:
+            template.flags = atoi(value);
             break;
         case KEY_PREFIX:
             strcpy(template.key_prefix, value);

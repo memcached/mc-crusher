@@ -67,6 +67,10 @@ key_prefix : a string to prefix before each key's number (default 'foo')
 
 value_size : size of the value to set
 
+expire : the expiration value (default 0)
+
+flags : client flags (raw number, default 0)
+
 value : define a value by hand. Must be shortish and a string.
 
 host : define a host to connect to
