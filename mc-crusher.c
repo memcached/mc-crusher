@@ -346,6 +346,11 @@ static int ascii_get_format(struct connection *c) {
                 (unsigned long long)*c->cur_key);
 }
 
+static int ascii_delete_format(struct connection *c) {
+    return sprintf(c->wbuf_pos, "delete %s%llu\r\n", c->key_prefix,
+                (unsigned long long)*c->cur_key);
+}
+
 static void ascii_write_to_client(void *arg) {
     struct connection *c = arg;
     struct iovec *vecs = c->vecs;
@@ -767,6 +772,9 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     } else if (strcmp(sender, "ascii_incr") == 0) {
         template.writer = ascii_write_to_client;
         template.ascii_format = ascii_incr_format;
+    } else if (strcmp(sender, "ascii_delete") == 0) {
+        template.writer = ascii_write_to_client;
+        template.ascii_format = ascii_delete_format;
     } else if (strcmp(sender, "ascii_decr") == 0) {
         template.writer = ascii_write_to_client;
         template.ascii_format = ascii_decr_format;

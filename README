@@ -52,6 +52,7 @@ Config Options
 send : defines what function to use to send requests to memcached
  - ascii_get : one get per request via asciiprot
  - ascii_set : one set per request via asciiprot
+ - ascii_delete : one delete per request via asciiprot
  - ascii_mget : multiget test via asciiprot
  - bin_get : one get per req via binprot
  - bin_getq : endless streaming multiget from hell
