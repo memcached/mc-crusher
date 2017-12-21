@@ -1,1 +1,2 @@
 send=ascii_get,recv=blind_read,conns=50,key_prefix=foobar,key_prealloc=0,pipelines=8
+send=ascii_set,recv=blind_read,conns=10,key_prefix=foobar,key_prealloc=0,pipelines=4,stop_after=200000,usleep=1000,value_size=10

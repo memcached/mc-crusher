@@ -86,7 +86,9 @@ iterate over large numbers of keys
 key_randomize : if using prealloc'ed keys, shuffle the list after generating
 
 usleep : fire one write event (up to pipeline count) with a microsecond sleep
-after
+after. the sleep is per-connection (so conns=2 will write twice per usleep)
+
+stop_after : stop all conns for this test after N writes have been made.
 
 Caveats
 -------

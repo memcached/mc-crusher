@@ -92,12 +92,14 @@ struct connection {
     uint32_t expire;
     uint32_t flags;
 
-    /* Buffers */
     uint64_t pipelines; /* number of repeated commands per write */
     uint64_t usleep; /* us to sleep between write runs */
+    uint64_t stop_after; /* run this many write events then stop */
+    /* Buffers */
     uint64_t key_count;
     uint64_t key_randomize;
     uint64_t *cur_key;
+    uint64_t *write_count;
     int      key_prealloc;
     struct mc_key *keys;
     unsigned char wbuf[65536];
@@ -218,6 +220,7 @@ static inline void run_counter(struct connection *c) {
         //fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
         *c->cur_key = 0;
     }
+    ++*c->write_count;
 }
 
 /* === BINARY PROTOCOL === */
@@ -433,6 +436,9 @@ static inline void run_write(struct connection *c) {
     }
     c->iov_towrite = sum_iovecs(c->vecs, c->iov_used);
     write_iovecs(c, c->next_state);
+    if (c->stop_after && *c->write_count >= c->stop_after) {
+        event_del(&c->ev);
+    }
 }
 
 static void client_handler(const int fd, const short which, void *arg) {
@@ -652,6 +658,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         MGET_COUNT,
         VALUE,
         RANDOMIZE,
+        STOP_AFTER,
         KEY_COUNT,
         KEY_PREALLOC,
         HOST,
@@ -678,6 +685,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         [MGET_COUNT]       = "mget_count",
         [VALUE]            = "value",
         [RANDOMIZE]        = "key_randomize",
+        [STOP_AFTER]       = "stop_after",
         [KEY_COUNT]        = "key_count",
         [KEY_PREALLOC]     = "key_prealloc",
         [HOST]             = "host",
@@ -707,7 +715,9 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     strcpy(template.port_num, port_num_default);
     template.next_state = conn_reading;
     template.cur_key = (uint64_t *)malloc(sizeof(uint64_t));
+    template.write_count = (uint64_t *)malloc(sizeof(uint64_t));
     *template.cur_key = 0;
+    *template.write_count = 0;
 
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
@@ -763,6 +773,9 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
             break;
         case RANDOMIZE:
             template.key_randomize = atoi(value);
+            break;
+        case STOP_AFTER:
+            template.stop_after = atoi(value);
             break;
         case KEY_COUNT:
             template.key_count = atoi(value);
