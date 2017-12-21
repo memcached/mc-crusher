@@ -51,6 +51,7 @@ enum conn_states {
     conn_connecting = 0,
     conn_sending,
     conn_reading,
+    conn_sleeping,
 };
 
 struct mc_key {
@@ -93,6 +94,7 @@ struct connection {
 
     /* Buffers */
     uint64_t pipelines; /* number of repeated commands per write */
+    uint64_t usleep; /* us to sleep between write runs */
     uint64_t key_count;
     uint64_t key_randomize;
     uint64_t *cur_key;
@@ -119,8 +121,10 @@ struct connection {
 };
 
 static void client_handler(const int fd, const short which, void *arg);
+static void sleep_handler(const int fd, const short which, void *arg);
 static void setup_thread(mc_thread *t);
 static void create_thread(mc_thread *t);
+static inline void run_write(struct connection *c);
 
 static int update_conn_event(struct connection *c, const int new_flags)
 {
@@ -132,6 +136,18 @@ static int update_conn_event(struct connection *c, const int new_flags)
     event_base_set(c->t->base, &c->ev);
 
     if (event_add(&c->ev, 0) == -1) return 0;
+    return 1;
+}
+
+static int update_conn_event_sleep(struct connection *c)
+{
+    struct timeval t = {.tv_sec = 0, .tv_usec = c->usleep};
+    if (event_del(&c->ev) == -1) return 0;
+
+    evtimer_set(&c->ev, sleep_handler, (void *)c);
+    event_base_set(c->t->base, &c->ev);
+    evtimer_add(&c->ev, &t);
+
     return 1;
 }
 
@@ -182,6 +198,8 @@ static void write_iovecs(struct connection *c, enum conn_states next_state) {
             update_conn_event(c, EV_READ | EV_PERSIST);
         } else if (c->state == conn_sending) {
             update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
+        } else if (c->state == conn_sleeping) {
+            update_conn_event_sleep(c);
         }
     }
 }
@@ -399,6 +417,13 @@ static void read_from_client(void *arg) {
 
 /* === HANDLERS === */
 
+static void sleep_handler(const int fd, const short which, void *arg) {
+    struct connection *c = (struct connection *)arg;
+    c->next_state = conn_sleeping;
+    c->reader(c);
+    run_write(c);
+}
+
 static inline void run_write(struct connection *c) {
     int i;
     c->wbuf_pos = c->wbuf;
@@ -512,9 +537,16 @@ static int new_connection(struct connection *t)
     c->state = conn_connecting;
     c->ev_flags = EV_WRITE;
 
-    event_set(&c->ev, sock, c->ev_flags, client_handler, (void *)c);
-    event_base_set(c->t->base, &c->ev);
-    event_add(&c->ev, NULL);
+    if (c->usleep) {
+        struct timeval t = {.tv_sec = 0, .tv_usec = c->usleep};
+        evtimer_set(&c->ev, sleep_handler, (void *)c);
+        event_base_set(c->t->base, &c->ev);
+        evtimer_add(&c->ev, &t);
+    } else{
+        event_set(&c->ev, sock, c->ev_flags, client_handler, (void *)c);
+        event_base_set(c->t->base, &c->ev);
+        event_add(&c->ev, NULL);
+    }
 
     if (c->iov_count > 0) {
         c->vecs = calloc(c->iov_count, sizeof(struct iovec));
@@ -609,7 +641,6 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         USLEEP,
         COUNT,
         CONNS,
-        SLEEP_EVERY,
         EXPIRE,
         FLAGS,
         KEY_PREFIX,
@@ -636,7 +667,6 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         [USLEEP]           = "usleep",
         [COUNT]            = "count",
         [CONNS]            = "conns",
-        [SLEEP_EVERY]      = "sleep_every",
         [EXPIRE]           = "expire",
         [FLAGS]            = "flags",
         [KEY_PREFIX]       = "key_prefix",
@@ -745,6 +775,9 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
             break;
         case PORT:
             strcpy(template.port_num, value);
+            break;
+        case USLEEP:
+            template.usleep = atoi(value);
             break;
         case THREAD:
             template.t = calloc(1, sizeof(mc_thread));

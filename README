@@ -85,6 +85,9 @@ iterate over large numbers of keys
 
 key_randomize : if using prealloc'ed keys, shuffle the list after generating
 
+usleep : fire one write event (up to pipeline count) with a microsecond sleep
+after
+
 Caveats
 -------
 
