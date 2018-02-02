@@ -14,7 +14,10 @@ Usage
 
 Look in the conf/ directory for example configuration files.
 
-$ ./mc-crusher ./conf/loadconf
+$ ./mc-crusher ./conf/loadconf [host] [port]
+defaults:
+host: 127.0.0.1
+port: 11211
 
 Running
 -------
