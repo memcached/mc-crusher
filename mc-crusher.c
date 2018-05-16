@@ -93,7 +93,8 @@ struct connection {
     uint32_t flags;
 
     uint64_t pipelines; /* number of repeated commands per write */
-    uint64_t usleep; /* us to sleep between write runs */
+    int usleep; /* us to sleep between write runs */
+    int ssleep; /* seconds to sleep */
     uint64_t stop_after; /* run this many write events then stop */
     /* Buffers */
     uint64_t key_count;
@@ -143,7 +144,7 @@ static int update_conn_event(struct connection *c, const int new_flags)
 
 static int update_conn_event_sleep(struct connection *c)
 {
-    struct timeval t = {.tv_sec = 0, .tv_usec = c->usleep};
+    struct timeval t = {.tv_sec = c->ssleep, .tv_usec = c->usleep};
     if (event_del(&c->ev) == -1) return 0;
 
     evtimer_set(&c->ev, sleep_handler, (void *)c);
@@ -479,6 +480,17 @@ static void client_handler(const int fd, const short which, void *arg) {
     }
 }
 
+#define U_PER_S 1000000
+static void timeval_split(const uint64_t in, int *outs, int *outu) {
+    if (in > U_PER_S) {
+        *outs = in / U_PER_S;
+        *outu = in - (*outs * U_PER_S);
+    } else {
+        *outs = 0;
+        *outu = in;
+    }
+}
+
 static int new_connection(struct connection *t)
 {
     int sock;
@@ -544,7 +556,12 @@ static int new_connection(struct connection *t)
     c->ev_flags = EV_WRITE;
 
     if (c->usleep) {
-        struct timeval t = {.tv_sec = 0, .tv_usec = c->usleep};
+        // spread out the initial wakeup times
+        int initsleep = random() % c->usleep;
+        int initsleep_s = 0;
+        timeval_split(c->usleep, &c->ssleep, &c->usleep);
+        timeval_split(initsleep, &initsleep_s, &initsleep);
+        struct timeval t = {.tv_sec = initsleep_s, .tv_usec = initsleep};
         evtimer_set(&c->ev, sleep_handler, (void *)c);
         event_base_set(c->t->base, &c->ev);
         evtimer_add(&c->ev, &t);
