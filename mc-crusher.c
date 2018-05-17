@@ -266,7 +266,7 @@ static void bin_prep_set(struct connection *c) {
     struct iovec *vecs = c->vecs;
     int i = c->iov_used;
     vecs[i].iov_base = c->wbuf_pos;
-    vecs[i].iov_len  = sizeof(protocol_binary_request_set);
+    vecs[i].iov_len  = sizeof(protocol_binary_request_header) + 8;
     c->wbuf_pos += vecs[i].iov_len;
     c->iov_used++;
 }
@@ -280,6 +280,20 @@ static void bin_prep_setq(struct connection *c) {
     pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_SETQ;
     // Continue to send since we don't expect to read anything.
     c->next_state = conn_sending;
+}
+
+static void bin_prep_touch(struct connection *c) {
+    protocol_binary_request_touch *pkt = (protocol_binary_request_touch *)c->wbuf_pos;
+    pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_TOUCH;
+    pkt->message.header.request.extlen = 4; /* exptime */
+    pkt->message.body.expiration = htonl(c->expire);
+
+    struct iovec *vecs = c->vecs;
+    int i = c->iov_used;
+    vecs[i].iov_base = c->wbuf_pos;
+    vecs[i].iov_len  = sizeof(protocol_binary_request_header) + 4;
+    c->wbuf_pos += vecs[i].iov_len;
+    c->iov_used++;
 }
 
 /* Unhappy with this, but it's still shorter/better than the old code.
@@ -865,6 +879,12 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         template.bin_format = bin_key_format;
         template.prealloc_format = bin_key_format;
         template.iov_count = 3;
+    } else if (strcmp(sender, "bin_touch") == 0) {
+        template.writer = bin_write_to_client;
+        template.bin_prep_cmd = bin_prep_touch;
+        template.bin_format = bin_key_format;
+        template.prealloc_format = bin_key_format;
+        template.iov_count = 2;
     } else {
         fprintf(stderr, "Unknown command writer: %s\n", sender);
         exit(1);
