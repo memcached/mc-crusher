@@ -1,0 +1,143 @@
+#!/usr/bin/perl
+# Copyright 2018 Dormando
+# Licensed under same terms as mc-crusher.c
+# First pass at a paced sampled fake-client latency aggregator.
+#
+# Goal: Show latency clustering while under load tests.
+# Bubbles should appear in the histogram as slow requests.
+# Requests faster than the pacing minimum sleep until the next increment
+# (ie: if < 1ms, sleep until 1ms has passed before sending next request)
+#
+# Uses blocking IO to simplify timing: This is the absolute time it takes for
+# a request/response cycle, rather than how long a request stayed queued
+# before being accessed in an event loop on the client side.
+#
+# Correlate with throughput numbers and system CPU metrics to determine if
+# bubbles are system pauses or slow requests.
+#
+# Future:
+# This beats what I had before, but what I want is a threadpool and a pacer
+# thread, dispatching up to N outstanding blocking requests.
+# Watching how backlogs queue, dequeue, and overflow can easily visualize
+# hangs vs slow requests. Can also round robin between client connections
+# (worker threads on the server).
+
+use warnings FATAL => 'all';
+use strict;
+
+use IO::Socket::INET;
+use Time::HiRes qw/time sleep usleep/;
+use Getopt::Long qw/:config no_ignore_case/;
+
+use FindBin;
+
+my $server = '127.0.0.1';
+my $port = '11211';
+my $prefix = 'foo';
+my $key_max = 5000;
+my $random = 0;
+my $dump_rate = 3;
+my $pace_time = 1000; # microseconds
+
+my $max_bucket = 8;
+
+if (!Getopt::Long::GetOptions(
+        'server|s=s' => \$server,
+        'port|p=s'   => \$port,
+        'prefix|f=s' => \$prefix,
+        'key_max|m=i' => \$key_max,
+        'random|r'   => \$random,
+        'pace_time'  => \$pace_time,
+        'dump_rate'  => \$dump_rate,
+    )) {
+    die "Bad arguments";
+}
+
+my @hist = ();
+my @global_hist = ();
+my $out_of_bounds = 0;
+$SIG{INT} = sub {
+    print "--- FINAL ---\n";
+    for (0..$max_bucket) {
+        $global_hist[$_] += $hist[$_];
+    }
+    print_hist('global');
+    exit;
+};
+
+sub print_hist {
+    my $global = shift;
+    print "--------------------\n";
+    my @hdr = ('1us', '10us', '100us', '1ms', '10ms', '100ms', '1s',
+               '10s', '100s');
+    for (0..scalar(@hist)-1) {
+        my $h = shift @hdr;
+        printf "%5s ", $h if $h;
+        if ($global) {
+            printf "  %d\n", $global_hist[$_];
+        } else {
+            printf "  %d\n", $hist[$_];
+        }
+    }
+    if ($out_of_bounds > 0) {
+        print "OOB: $out_of_bounds\n";
+    }
+    for (0..$max_bucket) {
+        $global_hist[$_] += $hist[$_];
+        $hist[$_] = 0;
+    }
+}
+
+# If the request processing took less than a millisecond, sleep for a bit.
+sub pace {
+    return if $pace_time == 0;
+    my $start = shift;
+    my $now = time();
+    my $e = ($now - $start) * 1000000;
+    if ($e < $pace_time) {
+        usleep($pace_time - $e);
+    }
+}
+
+# Build a dumpable histogram
+my $sock = IO::Socket::INET->new(PeerAddr => "$server:$port",
+    Timeout => 4);
+die "$!" unless $sock;
+
+for (0..$max_bucket) {
+    $hist[$_] = 0;
+    $global_hist[$_] = 0;
+}
+
+# We seed the random value after the request to make the pace timing simpler
+my $next_rand = 1;
+my $last_print = time();
+while (1) {
+    my $start = time();
+    print $sock "get ${prefix}$next_rand\r\n";
+    my $val = <$sock>;
+    my $end = time();
+    # We don't time past this point since the header is written to the network
+    # at the same time as the value, and we don't want to be timing perl
+    # processing.
+    # FIXME: Parse the line and read full value
+    if ($val =~ m/^VALUE/) {
+        while ($val !~ m/^END/) {
+            $val = <$sock>;
+        }
+    }
+    my $e = int(($end - $start) * 1000000);
+    my $bucket = int(log($e)/log(10));
+    # Egregiously slow requests
+    if ($bucket > $max_bucket) {
+        $out_of_bounds++;
+    }
+    $next_rand = int(rand($key_max))+1;
+
+    pace($start);
+    $hist[$bucket]++;
+    if ($start - $last_print >= $dump_rate) {
+        print_hist();
+        $last_print = time();
+    }
+}
