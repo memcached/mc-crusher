@@ -131,7 +131,7 @@ static inline void run_write(struct connection *c);
 
 static int update_conn_event(struct connection *c, const int new_flags)
 {
-    if (c->ev_flags == new_flags) return 1;
+    if (c->ev_flags == new_flags) return 2;
     if (event_del(&c->ev) == -1) return 0;
 
     c->ev_flags = new_flags;
@@ -147,6 +147,7 @@ static int update_conn_event_sleep(struct connection *c)
     struct timeval t = {.tv_sec = c->ssleep, .tv_usec = c->usleep};
     if (event_del(&c->ev) == -1) return 0;
 
+    c->ev_flags = 0; // clear event flags in case we ping-pong to other modes
     evtimer_set(&c->ev, sleep_handler, (void *)c);
     event_base_set(c->t->base, &c->ev);
     evtimer_add(&c->ev, &t);
@@ -478,7 +479,6 @@ static void client_handler(const int fd, const short which, void *arg) {
         }
         if (which & EV_WRITE) {
             if (c->iov_towrite > 0)
-                /* FIXME: Create a c->next_state or similar */
                 write_iovecs(c, c->next_state);
             if (c->iov_towrite <= 0) {
                 run_write(c);
@@ -913,8 +913,8 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
 
 static void *thread_runner(void *arg) {
     mc_thread *t = arg;
-    event_base_loop(t->base, 0);
-    fprintf(stderr, "Thread exiting\n");
+    int ret = event_base_loop(t->base, 0);
+    fprintf(stderr, "Thread exiting: %d\n", ret);
     return NULL;
 }
 
