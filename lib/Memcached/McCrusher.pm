@@ -22,6 +22,11 @@ sub new {
     return bless \%args, $class;
 }
 
+sub server_args  {
+    my $self =  shift;
+    $self->{server_args} = shift;
+}
+
 # Start the memcached with the supplied arguments
 # TODO: this assumes you're describing the server/port here.
 # do some argument parsing and pull it out from there if necessary
