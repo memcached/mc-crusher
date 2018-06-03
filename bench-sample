@@ -7,6 +7,7 @@ use strict;
 use IO::Socket::INET;
 use Time::HiRes;
 
+$|++;
 my $host        = shift @ARGV;
 my $MAX_RUNS    = shift @ARGV;
 my $SAMPLE_TIME = shift @ARGV || 2;

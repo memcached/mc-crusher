@@ -40,6 +40,7 @@ my $dump_rate = 3;
 my $pace_time = 1000; # microseconds
 
 my $max_bucket = 8;
+$|++;
 
 if (!Getopt::Long::GetOptions(
         'server|s=s' => \$server,
@@ -47,8 +48,8 @@ if (!Getopt::Long::GetOptions(
         'prefix|f=s' => \$prefix,
         'key_max|m=i' => \$key_max,
         'random|r'   => \$random,
-        'pace_time'  => \$pace_time,
-        'dump_rate'  => \$dump_rate,
+        'pace_time=i'  => \$pace_time,
+        'dump_rate=i'  => \$dump_rate,
     )) {
     die "Bad arguments";
 }
@@ -102,7 +103,7 @@ sub pace {
 # Build a dumpable histogram
 my $sock = IO::Socket::INET->new(PeerAddr => "$server:$port",
     Timeout => 4);
-die "$!" unless $sock;
+die "$server:$port $!" unless $sock;
 
 for (0..$max_bucket) {
     $hist[$_] = 0;

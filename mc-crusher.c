@@ -948,6 +948,8 @@ int main(int argc, char **argv)
 {
     FILE *cfd;
     char line[4096];
+    // kill buffering of stdout so a parent process can monitor it.
+    setvbuf(stdout, NULL, _IONBF, 0);
     mc_thread *main_thread = NULL;
     main_thread = calloc(1, sizeof(mc_thread));
     setup_thread(main_thread);
@@ -987,6 +989,7 @@ int main(int argc, char **argv)
         alarm(timer);
     }
     // TODO: Fire a signal at parent when threads exit? since they shouldn't.
+    printf("done initializing\n");
     pause();
     if (alarm_fired) {
         printf("timed run complete\n");
