@@ -1,0 +1,140 @@
+#!/usr/bin/perl
+# NOTE: adjust $crush_dir, $out_dir, $server_args and so on to adjust for your
+# particular hardware.
+# This file is left as an example for running a series of tests with
+# mc-crusher using the perl library.
+
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use lib "$Bin/lib";
+use Memcached::McCrusher;
+
+$|++;
+
+my $crush_dir = '/home/user/mc-crusher/';
+my $out_dir = '/home/user/output/';
+
+my $server_args= '-m 60000 -t 32 -o ext_path=/mnt/optane1/extstore,ext_wbuf_size=64,ext_threads=8,ext_item_size=384,ext_max_frag=0.20,ext_page_count=4000';
+my $key_count = 100_000_000;
+
+# FIXME: only require mc-crusher directory?
+my $bench = Memcached::McCrusher->new(
+    server_args => $server_args,
+    server_bin => '/home/dormando/memcached/memcached',
+    crush_bin => $crush_dir . 'mc-crusher',
+    latency_bin => $crush_dir . 'latency-sampler',
+    sample_bin => $crush_dir . 'bench-sample',
+    output_dir => $out_dir,
+);
+
+$bench->sample_args(
+    runs => 15,
+    period => 4,
+    stats => ['cmd_get', 'cmd_set', 'get_hits', 'extstore_objects_written', 'get_extstore'],
+);
+
+$bench->latency_args(
+    prefix => 'foo',
+    key_max => $key_count,
+    random => '',
+    dump_rate => 4
+);
+
+my $conf = qq{send=ascii_mget,recv=blind_read,conns=50,mget_count=20,key_prefix=foo,key_prealloc=1,key_count=100000000,key_randomize=1};
+my $pipe_conf = qq{send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=100000000,key_prealloc=0
+send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=100000000,thread=1,key_prealloc=0
+send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=100000000,thread=1,key_prealloc=0};
+my $mixed_conf = qq{send=ascii_mget,recv=blind_read,conns=50,mget_count=50,key_prefix=foo,key_prealloc=1,key_count=100000000,key_randomize=1
+send=ascii_set,recv=blind_read,conns=20,key_prefix=zoobar,key_prealloc=0,pipelines=8,usleep=200,value_size=550,key_count=20000000,thread=1};
+
+for my $device ('ssd', 'optane1') {
+    # Major test for each device
+    $server_args =~ s/ext_path=[^,]+/ext_path=\/mnt\/$device\/extstore/;
+
+    # optane saturates IO threads earlier
+    # really wish this was runtime tunable :(
+    my $io_thread_limit = $device eq 'ssd' ? 32 : 16;
+    my $io_threads = 4;
+    while ($io_threads <= $io_thread_limit) {
+        $server_args =~ s/ext_threads=\d+/ext_threads=$io_threads/;
+        my $out_base = $out_dir . $device . '_threads_' . $io_threads;
+        $io_threads *= 2;
+        $bench->server_args($server_args);
+        my $sock = $bench->start_memcached();
+
+        print "memc started\n";
+
+        $bench->warm(
+            prefix => 'foo',
+            exptime => 0,
+            size => 512,
+            count => $key_count,
+            progress => 1,
+        );
+
+        print $sock "extstore recache_rate 0\r\n";
+        my $res = <$sock>;
+        print $sock "extstore item_age 5\r\n";
+        $res = <$sock>;
+
+        wait_for_settle($bench);
+
+        # Test read-only mget scaling
+        for my $count (1..50) {
+            $conf =~ s/conns=\d+/conns=$count/g;
+            $bench->crush_config($conf);
+            my $out = $out_base . '_mget_conns_' . $count;
+            run($bench, $out);
+        }
+
+        # Test read-only piped get scaling
+        for my $count (1..30) {
+            $pipe_conf =~ s/conns=\d+/conns=$count/g;
+            $bench->crush_config($pipe_conf);
+            my $out = $out_base . '_pget_conns_' . $count;
+            run($bench, $out);
+        }
+
+        # Test mixed read-write load
+        for my $count (1..30) {
+            $mixed_conf =~ s/conns=\d+/conns=$count/g;
+            $bench->crush_config($mixed_conf);
+            my $out = $out_base . '_mgetset_conns_' . $count;
+            run($bench, $out);
+            wait_for_settle($bench);
+        }
+        $bench->stop_memcached();
+        sleep 1;
+    }
+}
+
+sub wait_for_settle {
+    my $bench = shift;
+    my $last_count = -1;
+    print "extstore flushing";
+    while (1) {
+        my $s = $bench->stats();
+        last if ($last_count == $s->{extstore_objects_written});
+        $last_count = $s->{extstore_objects_written};
+        print ".";
+        sleep 1;
+    }
+    print "\n";
+}
+
+sub run {
+    my $bench = shift;
+    my $out = shift;
+    mkdir($out);
+
+    $bench->output_dir($out); 
+    $bench->start_crush();
+    print "crush started!\n";
+    $bench->sample_run();
+    print "sampling complete\n";
+    $bench->stop_crush();
+    print "stopped crush... finished $out\n";
+}
+
+# automatically kills crusher/memcached
