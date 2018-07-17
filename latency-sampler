@@ -54,6 +54,8 @@ if (!Getopt::Long::GetOptions(
     die "Bad arguments";
 }
 
+# record all samples and dump at the end
+my @samples = ();
 my @hist = ();
 my @global_hist = ();
 my $out_of_bounds = 0;
@@ -63,6 +65,10 @@ $SIG{INT} = sub {
         $global_hist[$_] += $hist[$_];
     }
     print_hist('global');
+    print "---\n";
+    for (@samples) {
+        print $_->[0], ',', $_->[1], "\n";
+    }
     exit;
 };
 
@@ -128,6 +134,7 @@ while (1) {
         }
     }
     my $e = int(($end - $start) * 1000000);
+    push(@samples, [$start, $e]);
     my $bucket = int(log($e)/log(10));
     # Egregiously slow requests
     if ($bucket > $max_bucket) {
@@ -137,7 +144,7 @@ while (1) {
 
     pace($start);
     $hist[$bucket]++;
-    if ($start - $last_print >= $dump_rate) {
+    if ($dump_rate && $start - $last_print >= $dump_rate) {
         print_hist();
         $last_print = time();
     }
