@@ -10,6 +10,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: balloon [megabytes]\n");
         exit(1);
     }
+    // autoflush stdout.
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     int size = atoi(argv[1]);
     printf("megabytes: %d\n", size);
@@ -26,6 +28,7 @@ int main(int argc, char **argv) {
             temp[i] = i;
         }
     }
+    printf("done.\n");
 
     pause();
 }
