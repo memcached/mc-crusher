@@ -94,7 +94,6 @@ struct connection {
 
     uint64_t pipelines; /* number of repeated commands per write */
     int usleep; /* us to sleep between write runs */
-    int ssleep; /* seconds to sleep */
     uint64_t stop_after; /* run this many write events then stop */
     /* Buffers */
     uint64_t key_count;
@@ -106,6 +105,9 @@ struct connection {
     unsigned char wbuf[65536];
     unsigned char *wbuf_pos;
 
+    /* time pacing */
+    struct timeval next_sleep;
+    struct timeval tosleep;
     /* iovectors */
     struct iovec *vecs;
     int    iov_used; /* iovecs used so far */
@@ -144,12 +146,28 @@ static int update_conn_event(struct connection *c, const int new_flags)
 
 static int update_conn_event_sleep(struct connection *c)
 {
-    struct timeval t = {.tv_sec = c->ssleep, .tv_usec = c->usleep};
+    struct timeval t = {.tv_sec = 0, .tv_usec = 0};
+    struct timeval now;
     if (event_del(&c->ev) == -1) return 0;
 
     c->ev_flags = 0; // clear event flags in case we ping-pong to other modes
     evtimer_set(&c->ev, sleep_handler, (void *)c);
     event_base_set(c->t->base, &c->ev);
+
+    gettimeofday(&now, NULL);
+
+    // every time we come into this loop, we've run once. which means we
+    // always have to advance the next_sleep timer.
+    if (c->next_sleep.tv_sec == 0) {
+        // initialize next_sleep as late as possible to avoid spamming.
+        gettimeofday(&c->next_sleep, NULL);
+    }
+    memcpy(&t, &c->next_sleep, sizeof(struct timeval));
+    timeradd(&t, &c->tosleep, &c->next_sleep);
+
+    timersub(&c->next_sleep, &now, &t);
+    // so far as I can tell, it treats times in the past as "Wake up
+    // immediately".
     evtimer_add(&c->ev, &t);
 
     return 1;
@@ -181,7 +199,7 @@ static void write_iovecs(struct connection *c, enum conn_states next_state) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
             // the sender always checks for reads. not necessary to change?
-            //c->state = conn_reading;
+            c->state = conn_sending;
             return;
         } else {
             perror("Write error to client");
@@ -495,8 +513,8 @@ static void client_handler(const int fd, const short which, void *arg) {
 }
 
 #define U_PER_S 1000000
-static void timeval_split(const uint64_t in, int *outs, int *outu) {
-    if (in > U_PER_S) {
+static void timeval_split(const uint64_t in, long int *outs, long int *outu) {
+    if (in >= U_PER_S) {
         *outs = in / U_PER_S;
         *outu = in - (*outs * U_PER_S);
     } else {
@@ -516,8 +534,6 @@ static int new_connection(struct connection *t)
     int error;
     struct connection *c = (struct connection *)malloc(sizeof(struct connection));
     memcpy(c, t, sizeof(struct connection));
-
-    sock = socket(AF_INET, SOCK_STREAM, 0);
 
     error = getaddrinfo(c->host, c->port_num, &hints, &ai);
     if (error != 0) {
@@ -571,9 +587,9 @@ static int new_connection(struct connection *t)
 
     if (c->usleep) {
         // spread out the initial wakeup times
-        int initsleep = random() % c->usleep;
-        int initsleep_s = 0;
-        timeval_split(c->usleep, &c->ssleep, &c->usleep);
+        long int initsleep = random() % c->usleep;
+        long int initsleep_s = 0;
+        timeval_split(c->usleep, &c->tosleep.tv_sec, &c->tosleep.tv_usec);
         timeval_split(initsleep, &initsleep_s, &initsleep);
         struct timeval t = {.tv_sec = initsleep_s, .tv_usec = initsleep};
         evtimer_set(&c->ev, sleep_handler, (void *)c);
