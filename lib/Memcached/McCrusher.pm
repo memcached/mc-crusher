@@ -49,7 +49,7 @@ sub start_memcached {
         print "$bin $args\n";
         $self->{server_pid} = $child;
         sleep 1;
-        for (1 .. 10) {
+        for (1 .. 60) {
             my $conn = IO::Socket::INET->new(PeerAddr => "$ip:$port");
             if ($conn) {
                 $self->{server_conn} = $conn;
@@ -155,7 +155,7 @@ sub start_crush {
         # NOTE: If the child doesn't autoflush STDOUT, it can get lost :|
         open(STDOUT, ">", $cout) or die "STDOUT -> $cout: $!";
         open(STDERR, ">&STDOUT", ) or die "STDERR -> STDOUT: $!";
-        exec $bin, $cfile, $ip, $port;
+        exec "$bin $cfile $ip $port";
     }
 }
 
@@ -213,7 +213,7 @@ sub latency_args {
                " --port " . $self->{server_port};
     for my $key (keys %a) {
         $args .= " --$key " . $a{$key};
-        chop $args unless $a{$key};
+        chop $args if $a{$key} eq 'unset';
     }
     $self->{latency_args} = $args;
 }
@@ -239,7 +239,7 @@ sub start_latency {
         open(STDOUT, ">", $cout) or die "STDOUT -> $cout: $!";
         open(STDERR, ">&STDOUT", ) or die "STDERR -> STDOUT: $!";
         my @a = split(/\s+/, $args);
-        exec $bin, @a;
+        exec "$bin $args";
     }
 }
 
@@ -248,6 +248,67 @@ sub stop_latency {
     return unless $self->{latency_pid};
     # give it a chance to print final dump
     $self->_kill_pid($self->{latency_pid}, 2);
+}
+
+sub proc_meminfo {
+    my $self = shift;
+    my %r = ();
+    open(my $fh, "< /proc/meminfo");
+    while (my $line = <$fh>) {
+        # Seems to always be kB, but anchor just in case that changes.
+        if ($line =~ m/^(.+)\:\s+(\d+) kB/) {
+            $r{$1} = $2;
+        }
+    }
+    close($fh);
+    return \%r;
+}
+
+sub start_balloon {
+    my $self = shift;
+    my $size = shift;
+
+    my $bin = $self->{balloon_bin};
+
+    my $odir = $self->{output_dir} or die "missing output_dir";
+
+    my $cout = "$odir/balloon_output";
+
+    my $child = fork();
+
+    if ($child) {
+        print "$bin $size\n";
+        $self->{balloon_pid} = $child;
+        # try to open output file in loop
+        # watch for "done initializing\n"
+        # TODO: non-block reads, check for process death
+        sleep 1;
+        for (1..999) {
+            if (-e $cout) {
+                open(my $r, "< $cout") or die "Couldn't re-open $cout from parent";
+                while (my $l = <$r>) {
+                    if ($l =~ m/^done/) {
+                        # Tests are fully running.
+                        return;
+                    }
+                }
+            }
+            sleep 1;
+        }
+        die "balloon failed to initialize!";
+    } else {
+        # Child, re-open STDERR/STDOUT
+        # NOTE: If the child doesn't autoflush STDOUT, it can get lost :|
+        open(STDOUT, ">", $cout) or die "STDOUT -> $cout: $!";
+        open(STDERR, ">&STDOUT", ) or die "STDERR -> STDOUT: $!";
+        exec "$bin $size";
+    }
+}
+
+sub stop_balloon {
+    my $self = shift;
+    return unless $self->{balloon_pid};
+    $self->_kill_pid($self->{balloon_pid});
 }
 
 # run a sampler set.
@@ -261,7 +322,7 @@ sub sample_run {
 
     # wait for bench sampler to exit
     waitpid($self->{sample_pid}, 0);
-    # no forecfully kill the latency sampler, which should print its summary
+    # now forecfully kill the latency sampler, which should print its summary
     $self->stop_latency();
 }
 
