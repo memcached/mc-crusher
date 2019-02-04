@@ -3,6 +3,8 @@
 # particular hardware.
 # This file is left as an example for running a series of tests with
 # mc-crusher using the perl library.
+# for a NUMA system, use balloon to fill other node's memory to cut down
+# buffer cache.
 
 use strict;
 use warnings;
@@ -12,21 +14,25 @@ use Memcached::McCrusher;
 
 $|++;
 
-my $crush_dir = '/home/user/mc-crusher/';
-my $out_dir = '/home/user/output/';
+my $crush_dir = '/home/dormando/mc-crusher/';
+my $out_dir = '/home/dormando/output/';
 
-my $server_args= '-m 60000 -t 32 -o ext_path=/mnt/optane1/extstore,ext_wbuf_size=64,ext_threads=8,ext_item_size=384,ext_max_frag=0.20,ext_page_count=4000';
-my $key_count = 100_000_000;
+#my $server_args= '-m 60000 -t 32 -o ext_path=/mnt/optane1/extstore,ext_wbuf_size=64,ext_threads=8,ext_item_size=384,ext_max_frag=0.20,ext_page_count=4000,hashpower=27,no_lru_crawler';
+my $server_args= '-c 8192 -m 85000 -t 32 -o ext_path,ext_wbuf_size=64,ext_threads=8,ext_item_size=384,ext_max_frag=0.80,hashpower=27,no_lru_crawler';
+my $key_count = 120_000_000;
+my $numa_pfx = '/usr/bin/numactl --cpunodebind=0 --membind=0 ';
 
 # FIXME: only require mc-crusher directory?
 my $bench = Memcached::McCrusher->new(
     server_args => $server_args,
-    server_bin => '/home/dormando/memcached/memcached',
-    crush_bin => $crush_dir . 'mc-crusher',
-    latency_bin => $crush_dir . 'latency-sampler',
+    server_bin => '/usr/bin/numactl --cpunodebind=0 --membind=0 /home/dormando/memcached/memcached',
+    crush_bin => $numa_pfx . $crush_dir . 'mc-crusher',
+    balloon_bin => $numa_pfx . $crush_dir . 'balloon',
+    latency_bin => '/usr/bin/numactl --cpunodebind=1 --membind=1 ' . $crush_dir . 'latency-sampler',
     sample_bin => $crush_dir . 'bench-sample',
     output_dir => $out_dir,
 );
+#server_bin => '/usr/bin/numactl --cpunodebind=0 --membind=0 /home/dormando/memcached/memcached',
 
 $bench->sample_args(
     runs => 15,
@@ -37,30 +43,50 @@ $bench->sample_args(
 $bench->latency_args(
     prefix => 'foo',
     key_max => $key_count,
-    random => '',
-    dump_rate => 4
+    random => 'unset',
+    pace_time => 5000,
+    dump_rate => 0
 );
 
-my $conf = qq{send=ascii_mget,recv=blind_read,conns=50,mget_count=20,key_prefix=foo,key_prealloc=1,key_count=100000000,key_randomize=1};
-my $pipe_conf = qq{send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=100000000,key_prealloc=0
-send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=100000000,thread=1,key_prealloc=0
-send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=100000000,thread=1,key_prealloc=0};
-my $mixed_conf = qq{send=ascii_mget,recv=blind_read,conns=50,mget_count=50,key_prefix=foo,key_prealloc=1,key_count=100000000,key_randomize=1
-send=ascii_set,recv=blind_read,conns=20,key_prefix=zoobar,key_prealloc=0,pipelines=8,usleep=200,value_size=550,key_count=20000000,thread=1};
+my $conf = qq{send=ascii_mget,recv=blind_read,conns=50,mget_count=20,key_prefix=foo,key_prealloc=1,key_count=$key_count,key_randomize=1};
+my $pipe_conf = qq{send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=$key_count,key_prealloc=1,key_randomize=1
+send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=$key_count,thread=1,key_prealloc=1,key_randomize=1};
+my $mixed_conf = qq{send=ascii_mget,recv=blind_read,conns=50,mget_count=50,key_prefix=foo,key_prealloc=1,key_count=$key_count,key_randomize=1
+send=ascii_set,recv=blind_read,conns=20,key_prefix=zoobar,key_prealloc=0,pipelines=8,value_size=550,key_count=20000000,thread=1};
+my $paced_conf = qq{send=ascii_get,recv=blind_read,conns=1,key_prefix=foo,pipelines=50,key_prealloc=1,key_count=$key_count,key_randomize=1,usleep=50000
+send=ascii_get,recv=blind_read,conns=1,key_prefix=foo,pipelines=50,key_prealloc=1,key_count=$key_count,key_randomize=1,usleep=50000,thread=1};
 
-for my $device ('ssd', 'optane1') {
-    # Major test for each device
-    $server_args =~ s/ext_path=[^,]+/ext_path=\/mnt\/$device\/extstore/;
+my @devices = ();
+for my $device ('ram', 'ssd', 'optane1', 'optane2', 'optane3') {
+    my $sargs = $server_args;
+    my $devline;
+    my $type;
+    my @tests = ();
+    if ($device =~ m/^optane/) {
+        push(@devices, "ext_path=/mnt/$device/extstore:256g");
+        $devline = join(',', @devices);
+        $type = (scalar @devices) . "optane";
+        @tests = (24, 32, 40, 48);
+    } elsif ($device eq "ssd") {
+        $devline = "ext_path=/mnt/$device/extstore:256g";
+        $type = "ssd";
+        @tests = (64, 96);
+    } elsif ($device eq "ram") {
+        # for RAM only, ensure we don't actually write to extstore.
+        $devline = "ext_path=/dev/shm/extstore:1g";
+        my $size = 1024 * 1024;
+        $sargs =~ s/ext_item_size=384/ext_item_size=$size/;
+        $type = "ram";
+        @tests = (16);
+    }
+    $sargs =~ s/ext_path/$devline/;
+    my $dcount = scalar @devices;
+    my $io_threads = 16;
+    my $conn_max = 21; # 31
+    my $conn_step = 1; # 2
 
-    # optane saturates IO threads earlier
-    # really wish this was runtime tunable :(
-    my $io_thread_limit = $device eq 'ssd' ? 32 : 16;
-    my $io_threads = 4;
-    while ($io_threads <= $io_thread_limit) {
-        $server_args =~ s/ext_threads=\d+/ext_threads=$io_threads/;
-        my $out_base = $out_dir . $device . '_threads_' . $io_threads;
-        $io_threads *= 2;
-        $bench->server_args($server_args);
+    my $test_set = sub {
+        $bench->server_args($sargs);
         my $sock = $bench->start_memcached();
 
         print "memc started\n";
@@ -77,34 +103,28 @@ for my $device ('ssd', 'optane1') {
         my $res = <$sock>;
         print $sock "extstore item_age 5\r\n";
         $res = <$sock>;
+        sleep 5;
 
         wait_for_settle($bench);
+        my $out_base = $out_dir . 'device_' . $type . '_threads_' . $io_threads;
 
-        # Test read-only mget scaling
-        for my $count (1..50) {
-            $conf =~ s/conns=\d+/conns=$count/g;
-            $bench->crush_config($conf);
-            my $out = $out_base . '_mget_conns_' . $count;
+        # paced configuration should increment by 50k r/s per conn.
+        for (my $count = 1; $count <= $conn_max; $count += $conn_step) {
+            my $conns = $count * 25;
+            $paced_conf =~ s/conns=\d+/conns=$conns/g;
+            $bench->crush_config($paced_conf);
+            my $out = $out_base . '_paced_conns_' . $count;
             run($bench, $out);
         }
 
-        # Test read-only piped get scaling
-        for my $count (1..30) {
-            $pipe_conf =~ s/conns=\d+/conns=$count/g;
-            $bench->crush_config($pipe_conf);
-            my $out = $out_base . '_pget_conns_' . $count;
-            run($bench, $out);
-        }
-
-        # Test mixed read-write load
-        for my $count (1..30) {
-            $mixed_conf =~ s/conns=\d+/conns=$count/g;
-            $bench->crush_config($mixed_conf);
-            my $out = $out_base . '_mgetset_conns_' . $count;
-            run($bench, $out);
-            wait_for_settle($bench);
-        }
         $bench->stop_memcached();
+    };
+
+    # test 2-3 devices and SSD with increasing io threads
+    for my $lim (@tests) {
+        $io_threads = $lim;
+        $sargs =~ s/ext_threads=\d+/ext_threads=$io_threads/;
+        $test_set->();
         sleep 1;
     }
 }
@@ -126,15 +146,27 @@ sub wait_for_settle {
 sub run {
     my $bench = shift;
     my $out = shift;
+    my $overhead = shift || 5000;
     mkdir($out);
 
     $bench->output_dir($out); 
     $bench->start_crush();
     print "crush started!\n";
+    my $mem = $bench->proc_meminfo();
+    my $avail = $mem->{MemAvailable} / 1024;
+    my $bsize = int($avail - $overhead);
+    print "memory avail: [$avail] - inflating balloon for [$bsize]\n";
+    if ($bsize > 0) {
+        $bench->start_balloon($bsize);
+    }
+    print "balloon started\n";
     $bench->sample_run();
     print "sampling complete\n";
     $bench->stop_crush();
     print "stopped crush... finished $out\n";
+    if ($bsize > 0) {
+        $bench->stop_balloon();
+    }
 }
 
 # automatically kills crusher/memcached
