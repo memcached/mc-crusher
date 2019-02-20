@@ -55,7 +55,7 @@ enum conn_states {
 };
 
 struct mc_key {
-    unsigned char *key;
+    uint64_t key_offset;
     size_t key_len;
 };
 
@@ -97,11 +97,13 @@ struct connection {
     uint64_t stop_after; /* run this many write events then stop */
     /* Buffers */
     uint64_t key_count;
+    uint64_t key_blob_size;
     uint64_t key_randomize;
     uint64_t *cur_key;
     uint64_t *write_count;
     int      key_prealloc;
-    struct mc_key *keys;
+    struct mc_key *keys; // pointers into key_blob.
+    unsigned char *key_blob;
     unsigned char wbuf[65536];
     unsigned char *wbuf_pos;
 
@@ -327,7 +329,7 @@ static void bin_write_to_client(void *arg) {
     pkt->request.magic = PROTOCOL_BINARY_REQ;
     c->bin_prep_cmd(c);
     if (c->key_prealloc) {
-        vecs[c->iov_used].iov_base = c->keys[*c->cur_key].key;
+        vecs[c->iov_used].iov_base = &c->key_blob[c->keys[*c->cur_key].key_offset];
         vecs[c->iov_used].iov_len  = c->keys[*c->cur_key].key_len;
     } else {
         vecs[c->iov_used].iov_base = c->wbuf_pos;
@@ -367,7 +369,7 @@ static void ascii_write_mget_to_client(void *arg) {
     vecs[0].iov_len  = 4;
     for (i = 1; i < c->mget_count + 1; i++) {
         if (c->key_prealloc) {
-            vecs[i].iov_base = c->keys[*c->cur_key].key;
+            vecs[i].iov_base = &c->key_blob[c->keys[*c->cur_key].key_offset];
             vecs[i].iov_len  = c->keys[*c->cur_key].key_len;
         } else {
             vecs[i].iov_base = c->wbuf_pos;
@@ -410,7 +412,7 @@ static void ascii_write_to_client(void *arg) {
     struct connection *c = arg;
     struct iovec *vecs = c->vecs;
     if (c->key_prealloc) {
-        vecs[c->iov_used].iov_base = c->keys[*c->cur_key].key;
+        vecs[c->iov_used].iov_base = &c->key_blob[c->keys[*c->cur_key].key_offset];
         vecs[c->iov_used].iov_len  = c->keys[*c->cur_key].key_len;
     } else {
         vecs[c->iov_used].iov_base = c->wbuf_pos;
@@ -612,7 +614,7 @@ static int new_connection(struct connection *t)
     return sock;
 }
 
-static void prealloc_keys(struct connection *t) {
+static void prealloc_keys(struct connection *t, const size_t key_blob_size) {
     /* This "leaks" the blob on purpose. Also temporary hardcoded rough key
      * length is used. 
      */
@@ -623,34 +625,46 @@ static void prealloc_keys(struct connection *t) {
     uint64_t i;
     int x;
     int len = 0;
+    uint64_t used = 0;
     long int rand_one;
     long int rand_two;
     char *fmt;
 
     /* Generate the blobs and key list */
-    key_blob = calloc(t->key_count, 60);
+    if (key_blob_size != 0) {
+        key_blob = calloc(key_blob_size, sizeof(char));
+        t->key_blob_size = key_blob_size;
+    } else {
+        key_blob = calloc(t->key_count, 60);
+        t->key_blob_size = t->key_count * 60;
+    }
     keys     = calloc(t->key_count, sizeof(struct mc_key));
     if (key_blob == NULL || keys == NULL) {
         perror("Mallocing key prealloc");
         exit(1);
     }
     key_blob_ptr = key_blob;
-    fprintf(stdout, "Prealloc memory: %llu + %llu\n", (unsigned long long)(t->key_count) * 60,
+    fprintf(stdout, "Prealloc memory: %llu + %llu\n", (unsigned long long)(t->key_blob_size),
         (unsigned long long)sizeof(struct mc_key) * (t->key_count));
 
     // Make the formatter think it's writing into wbuf.
     t->wbuf_pos = key_blob_ptr;
     for (i = 0; i < t->key_count; i++) {
         len = t->prealloc_format(t);
-        keys[i].key     = t->wbuf_pos;
+        keys[i].key_offset = used;
         keys[i].key_len = len;
         t->wbuf_pos    += len;
+        used += len;
         run_counter(t);
     }
     t->wbuf_pos = t->wbuf;
     *t->cur_key = 0;
 
     t->keys = keys;
+    t->key_blob = key_blob;
+    t->key_blob_size = used;
+
+    fprintf(stdout, "key_blob used: %llu\n", (unsigned long long)used);
 
     /* Cool, now shuffle the key list if we need to */
     if (t->key_randomize == 0)
@@ -707,6 +721,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         RANDOMIZE,
         STOP_AFTER,
         KEY_COUNT,
+        KEY_BLOB_SIZE,
         KEY_PREALLOC,
         HOST,
         PORT,
@@ -734,6 +749,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         [RANDOMIZE]        = "key_randomize",
         [STOP_AFTER]       = "stop_after",
         [KEY_COUNT]        = "key_count",
+        [KEY_BLOB_SIZE]    = "key_blob_size",
         [KEY_PREALLOC]     = "key_prealloc",
         [HOST]             = "host",
         [PORT]             = "port",
@@ -753,6 +769,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     template.use_shared_value = 1;
     template.buf_written = 0;
     template.key_count = 200000;
+    template.key_blob_size = 0;
     template.key_randomize = 0;
     template.key_prealloc = 1;
     template.pipelines = 1;
@@ -826,6 +843,9 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
             break;
         case KEY_COUNT:
             template.key_count = atoi(value);
+            break;
+        case KEY_BLOB_SIZE:
+            template.key_blob_size = atoi(value);
             break;
         case KEY_PREALLOC:
             template.key_prealloc = atoi(value);
@@ -910,7 +930,8 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         if (!template.prealloc_format) {
             template.prealloc_format = template.ascii_format;
         }
-        prealloc_keys(&template);
+        // FIXME: just fetch from the template?
+        prealloc_keys(&template, template.key_blob_size);
     }
     // FIXME: Should use iov_count for prealloc, iov_used for writers.
     template.iov_count = template.iov_count * template.pipelines;
