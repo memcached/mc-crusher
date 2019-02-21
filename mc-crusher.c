@@ -21,6 +21,8 @@
 #include <netdb.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <stdbool.h>
+#include <getopt.h>
 
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -614,6 +616,112 @@ static int new_connection(struct connection *t)
     return sock;
 }
 
+// TODO: use a header line or meta file to determine when the file's changed.
+static bool load_keys(struct connection *t, const char *file) {
+    size_t index_size = sizeof(struct mc_key) * t->key_count;
+    size_t key_blob_size = 0;
+    char ptmp[1024];
+    struct stat statbuf;
+
+    snprintf(ptmp, 1023, "%s.idx", file);
+    FILE *ki = fopen(ptmp, "r");
+    if (ki == NULL) {
+        perror("Failed to open key index file for reading\n");
+        return false;
+    }
+
+    t->keys = malloc(index_size);
+    if (t->keys == NULL) {
+        fprintf(stderr, "Failed to malloc space for key index\n");
+        exit(1);
+    }
+
+    fprintf(stdout, "Loading key index file of size: %lu\n", index_size);
+    {
+        size_t read = fread(t->keys, 1, index_size, ki);
+        if (read < index_size) {
+            fprintf(stderr, "Failed to read key index file\n");
+            exit(1);
+        }
+    }
+    fclose(ki);
+
+    // key blob file size is unknown, so we ask the filesystem.
+    snprintf(ptmp, 1023, "%s.keys", file);
+    if (stat(ptmp, &statbuf) != 0) {
+        perror("Failed to stat key blob file");
+        return false;
+    }
+
+    key_blob_size = statbuf.st_size;
+
+    FILE *kf = fopen(ptmp, "r");
+    if (kf == NULL) {
+        perror("Failed to open key blob file for reading");
+        exit(1);
+    }
+
+    t->key_blob_size = key_blob_size;
+    t->key_blob = malloc(key_blob_size);
+    if (t->key_blob == NULL) {
+        fprintf(stderr, "Failed to malloc space for key blob\n");
+        exit(1);
+    }
+
+    fprintf(stdout, "Loading key blob file of size: %lu\n", key_blob_size);
+    {
+        size_t read = fread(t->key_blob, 1, key_blob_size, kf);
+        if (read < key_blob_size) {
+            fprintf(stderr, "Failed to read key blob file\n");
+            exit(1);
+        }
+    }
+
+    fclose(kf);
+    return true;
+}
+
+// FIXME: could put it all in one file since key index size is known?
+static void write_keys(const struct connection *t, const char *file) {
+    size_t index_size = sizeof(struct mc_key) * t->key_count;
+    size_t key_blob_size = t->key_blob_size;
+    char ptmp[1024];
+
+    snprintf(ptmp, 1023, "%s.idx", file);
+    FILE *ki = fopen(ptmp, "w");
+    if (ki == NULL) {
+        perror("Failed to open key index file for writing");
+        exit(1);
+    }
+
+    {
+        size_t written = fwrite(t->keys, 1, index_size, ki);
+        if (written < index_size) {
+            // TODO: how to actually use ferror?
+            fprintf(stderr, "failed to write data to key index file\n");
+            exit(1);
+        }
+    }
+    fclose(ki);
+
+    snprintf(ptmp, 1023, "%s.keys", file);
+    FILE *kf = fopen(ptmp, "w");
+    if (kf == NULL) {
+        perror("Failed to open key blob file for writing");
+        exit(1);
+    }
+
+    {
+        size_t written = fwrite(t->key_blob, 1, key_blob_size, kf);
+        if (written < key_blob_size) {
+            // TODO: how to actually use ferror?
+            fprintf(stderr, "failed to write data to key blob file\n");
+            exit(1);
+        }
+    }
+    fclose(kf);
+}
+
 static void prealloc_keys(struct connection *t, const size_t key_blob_size) {
     /* This "leaks" the blob on purpose. Also temporary hardcoded rough key
      * length is used. 
@@ -690,7 +798,7 @@ static void prealloc_keys(struct connection *t, const size_t key_blob_size) {
 }
 
 /* Get a little verbose to avoid a big if/else if tree */
-static void parse_config_line(mc_thread *main_thread, char *line) {
+static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
     char *in_progress, *token;
     struct connection template;
     int conns_tomake = 1;
@@ -700,6 +808,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     char *sender = NULL;
     int add_space = 0;
     int new_thread = 0;
+    char key_file[1024];
 
     enum {
         SEND = 0,
@@ -723,6 +832,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         KEY_COUNT,
         KEY_BLOB_SIZE,
         KEY_PREALLOC,
+        KEY_FILE,
         HOST,
         PORT,
         THREAD,
@@ -751,6 +861,7 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         [KEY_COUNT]        = "key_count",
         [KEY_BLOB_SIZE]    = "key_blob_size",
         [KEY_PREALLOC]     = "key_prealloc",
+        [KEY_FILE]         = "key_file",
         [HOST]             = "host",
         [PORT]             = "port",
         [THREAD]           = "thread",
@@ -850,6 +961,9 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
         case KEY_PREALLOC:
             template.key_prealloc = atoi(value);
             break;
+        case KEY_FILE:
+            strcpy(key_file, value);
+            break;
         case HOST:
             strcpy(template.host, value);
             break;
@@ -927,14 +1041,30 @@ static void parse_config_line(mc_thread *main_thread, char *line) {
     }
 
     if (template.key_prealloc) {
+        bool have_keys = false;
         if (!template.prealloc_format) {
             template.prealloc_format = template.ascii_format;
         }
-        // FIXME: just fetch from the template?
-        prealloc_keys(&template, template.key_blob_size);
+        if (key_file != NULL) {
+            have_keys = load_keys(&template, key_file);
+        }
+
+        // FIXME: just fetch key_blob_size from the template?
+        if (!have_keys) {
+            prealloc_keys(&template, template.key_blob_size);
+        }
+
+        if (!have_keys && key_file != NULL) {
+            write_keys(&template, key_file);
+        }
     }
     // FIXME: Should use iov_count for prealloc, iov_used for writers.
     template.iov_count = template.iov_count * template.pipelines;
+
+    // don't actually do anything if we're just here to pre-generate keys
+    if (keygen) {
+        return;
+    }
 
     for (i = 0; i < conns_tomake; i++) {
         newsock = new_connection(&template);
@@ -983,51 +1113,86 @@ static void alarm_handler(int signal) {
 
 int main(int argc, char **argv)
 {
-    FILE *cfd;
+    FILE *cfd = NULL;
     char line[4096];
+    int timeout = 0;
+    bool keygen = false; // exit after reading configuration.
     // kill buffering of stdout so a parent process can monitor it.
     setvbuf(stdout, NULL, _IONBF, 0);
     mc_thread *main_thread = NULL;
     main_thread = calloc(1, sizeof(mc_thread));
     setup_thread(main_thread);
 
-    if (argc > 2) {
-        strncpy(host_default, argv[2], NI_MAXHOST);
-        printf("ip address default: %s\n", host_default);
-    }
-    if (argc > 3) {
-        strncpy(port_num_default, argv[3], NI_MAXSERV);
-        printf("port default: %s\n", port_num_default);
+    const struct option longopts[] = {
+        // standard operational options
+        {"ip", required_argument, 0, 'i'},
+        {"port", required_argument, 0, 'p'},
+        {"conf", required_argument, 0, 'c'},
+        {"timeout", required_argument, 0, 't'},
+        // keygen mode. exits after generating key files.
+        {"keygen", no_argument, 0, 'k'},
+        // end of options.
+        {0, 0, 0, 0}
+    };
+    int optindex;
+    int c;
+    while (-1 != (c = getopt_long(argc, argv, "", longopts, &optindex))) {
+        switch (c) {
+        case 'i':
+            strncpy(host_default, optarg, NI_MAXHOST);
+            printf("ip address default: %s\n", host_default);
+            break;
+        case 'p':
+            strncpy(port_num_default, optarg, NI_MAXSERV);
+            printf("port default: %s\n", port_num_default);
+            break;
+        case 'c':
+            cfd = fopen(optarg, "r");
+            if (cfd == NULL) {
+                perror("Opening config file");
+                exit(1);
+            }
+            break;
+        case 't':
+            timeout = atoi(optarg);
+            break;
+        case 'k':
+            keygen = true;
+            break;
+        default:
+            fprintf(stderr, "Unknown option\n");
+        }
     }
 
-    cfd = fopen(argv[1], "r");
     if (cfd == NULL) {
-        perror("Opening config file");
+        fprintf(stderr, "error: use --conf [file] to specify a config file\n");
         exit(1);
     }
 
     while (fgets(line, 4096, cfd) != NULL) {
-        parse_config_line(main_thread, line);
+        parse_config_line(main_thread, line, keygen);
     }
     fclose(cfd);
 
-    create_thread(main_thread);
+    if (!keygen) {
+        create_thread(main_thread);
+    }
 
-    // TODO: Use a real argument parser.
-    if (argc > 4) {
+    if (timeout != 0) {
         struct sigaction sig_h;
 
         sig_h.sa_handler = alarm_handler;
         sig_h.sa_flags = 0;
 
         sigaction(SIGALRM, &sig_h, NULL);
-        int timer = atoi(argv[4]);
-        fprintf(stderr, "setting a timer\n");
-        alarm(timer);
+        fprintf(stderr, "setting a timeout\n");
+        alarm(timeout);
     }
     // TODO: Fire a signal at parent when threads exit? since they shouldn't.
     printf("done initializing\n");
-    pause();
+    if (!keygen) {
+        pause();
+    }
     if (alarm_fired) {
         printf("timed run complete\n");
     }
