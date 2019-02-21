@@ -40,7 +40,11 @@
 #include <sys/stat.h>
 #include <signal.h>
 
+// for pow() for zipf calculations.
+#include <math.h>
+
 #include "protocol_binary.h"
+#include "pcg-basic.h"
 
 #define SHARED_RBUF_SIZE 1024 * 64
 #define SHARED_VALUE_SIZE 1024 * 1024
@@ -98,16 +102,21 @@ struct connection {
     int usleep; /* us to sleep between write runs */
     uint64_t stop_after; /* run this many write events then stop */
     /* Buffers */
-    uint64_t key_count;
     uint64_t key_blob_size;
     uint64_t key_randomize;
     uint64_t *cur_key;
     uint64_t *write_count;
+    uint32_t key_count;
     int      key_prealloc;
     struct mc_key *keys; // pointers into key_blob.
     unsigned char *key_blob;
     unsigned char wbuf[65536];
     unsigned char *wbuf_pos;
+
+    /* random number handling */
+    pcg32_random_t rng; // every connection can have its own rng.
+    double zipf_skew;
+    double zipf_t; // precalc against the skew
 
     /* time pacing */
     struct timeval next_sleep;
@@ -134,6 +143,9 @@ static void sleep_handler(const int fd, const short which, void *arg);
 static void setup_thread(mc_thread *t);
 static void create_thread(mc_thread *t);
 static inline void run_write(struct connection *c);
+
+static uint32_t zipf_sample(pcg32_random_t *rng, double t, double skew);
+static double zipf_calc_t(uint32_t n, double skew);
 
 static int update_conn_event(struct connection *c, const int new_flags)
 {
@@ -245,6 +257,39 @@ static inline void run_counter(struct connection *c) {
         *c->cur_key = 0;
     }
     ++*c->write_count;
+}
+
+// adapted from: https://medium.com/@jasoncrease/rejection-sampling-the-zipf-distribution-6b359792cffa
+static uint32_t zipf_sample(pcg32_random_t *rng, double t, double skew) {
+    double inv_B;
+    double X, R;
+    double inv_skew = 1.0 / (1.0 - skew);
+    for (;;) {
+        // always need two random samples, so exploit some cache coherency and
+        // grab them at the same time.
+        double rand_b = pcg32_double_r(rng);
+        double rand_y = pcg32_double_r(rng);
+
+        double t_b = rand_b * t;
+        // inv cdf for b.
+        if (t_b <= 1) {
+            inv_B = t_b;
+        } else {
+            inv_B = pow(t_b * (1.0 - skew) + skew, inv_skew);
+        }
+
+        X = floor(inv_B - 1.0);
+        R = pow(X, -skew) /
+            ((X <= 1.0 ? 1.0 / t : pow(inv_B, -skew) / t) * t);
+
+        if (rand_y < R) {
+            return (uint32_t)X;
+        }
+    }
+}
+
+static double zipf_calc_t(uint32_t n, double skew) {
+    return (pow((double)n, 1.0 - skew) - skew) / (1 - skew);
 }
 
 /* === BINARY PROTOCOL === */
@@ -539,6 +584,13 @@ static int new_connection(struct connection *t)
     struct connection *c = (struct connection *)malloc(sizeof(struct connection));
     memcpy(c, t, sizeof(struct connection));
 
+    // no reason to avoid initializing an rng. this gives us a sequence unique
+    // to the memory address of this particular connection.
+    // could also mix or adjust time, but according to the PCG documentation
+    // this shouldn't matter and we're not after secure randomization.
+    // TODO: Should find some way to make this deterministic.
+    pcg32_srandom_r(&c->rng, time(NULL), (intptr_t)c);
+
     error = getaddrinfo(c->host, c->port_num, &hints, &ai);
     if (error != 0) {
         if (error != EAI_SYSTEM) {
@@ -734,8 +786,8 @@ static void prealloc_keys(struct connection *t, const size_t key_blob_size) {
     int x;
     int len = 0;
     uint64_t used = 0;
-    long int rand_one;
-    long int rand_two;
+    uint32_t rand_one;
+    uint32_t rand_two;
     char *fmt;
 
     /* Generate the blobs and key list */
@@ -779,13 +831,14 @@ static void prealloc_keys(struct connection *t, const size_t key_blob_size) {
         return;
 
     /* TODO: Allow specifying the random seed */
-    srandom(time(NULL));
+    pcg32_random_t rng;
+    pcg32_srandom_r(&rng, 42u, 54u);
 
     /* Run through the list once and shuffle */
     for (x = 0; x < 4; x++) {
     for (i = 0; i < t->key_count; i++) {
-        rand_one = random() % t->key_count;
-        rand_two = random() % t->key_count;
+        rand_one = pcg32_boundedrand_r(&rng, t->key_count);
+        rand_two = pcg32_boundedrand_r(&rng, t->key_count);
         temp = keys[rand_one];
         keys[rand_one] = keys[rand_two];
         keys[rand_two] = temp;
@@ -1117,6 +1170,8 @@ int main(int argc, char **argv)
     char line[4096];
     int timeout = 0;
     bool keygen = false; // exit after reading configuration.
+    double zipf_s = 0;
+    int zipf_n = 0;
     // kill buffering of stdout so a parent process can monitor it.
     setvbuf(stdout, NULL, _IONBF, 0);
     mc_thread *main_thread = NULL;
@@ -1131,6 +1186,9 @@ int main(int argc, char **argv)
         {"timeout", required_argument, 0, 't'},
         // keygen mode. exits after generating key files.
         {"keygen", no_argument, 0, 'k'},
+        // test mode for zipf distributions
+        {"zipf-n", required_argument, 0, 'z'},
+        {"zipf-s", required_argument, 0, 'x'},
         // end of options.
         {0, 0, 0, 0}
     };
@@ -1159,9 +1217,26 @@ int main(int argc, char **argv)
         case 'k':
             keygen = true;
             break;
+        case 'z':
+            zipf_n = atoi(optarg);
+            break;
+        case 'x':
+            zipf_s = strtod(optarg, NULL);
+            break;
         default:
             fprintf(stderr, "Unknown option\n");
         }
+    }
+
+    // zipf tester. dumps a bunch of numbers then exits.
+    if (zipf_n != 0 && zipf_s != 0) {
+        pcg32_random_t rng;
+        pcg32_srandom_r(&rng, time(NULL), 54u);
+        double zipf_t = zipf_calc_t(zipf_n, zipf_s);
+        for (int x = 0; x < 10000000; x++) {
+            fprintf(stdout, "%u\n", zipf_sample(&rng, zipf_t, zipf_s));
+        }
+        exit(1);
     }
 
     if (cfd == NULL) {
