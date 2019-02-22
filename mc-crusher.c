@@ -60,6 +60,12 @@ enum conn_states {
     conn_sleeping,
 };
 
+enum conn_rand {
+    conn_rand_off = 0,
+    conn_rand_uniform,
+    conn_rand_zipf,
+};
+
 struct mc_key {
     uint64_t key_offset;
     size_t key_len;
@@ -115,6 +121,7 @@ struct connection {
 
     /* random number handling */
     pcg32_random_t rng; // every connection can have its own rng.
+    enum conn_rand rand; // randomized options for run_counter().
     double zipf_skew;
     double zipf_t; // precalc against the skew
 
@@ -252,11 +259,21 @@ static inline int sum_iovecs(const struct iovec *vecs, const int iov_count) {
 }
 
 static inline void run_counter(struct connection *c) {
-    if (++*c->cur_key >= c->key_count) {
-        //fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
-        *c->cur_key = 0;
+    ++*c->write_count; // for limiting requests in a particular test
+    switch (c->rand) {
+        case conn_rand_off:
+            if (++*c->cur_key >= c->key_count) {
+                //fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
+                *c->cur_key = 0;
+            }
+            break;
+        case conn_rand_uniform:
+            *c->cur_key = pcg32_boundedrand_r(&c->rng, c->key_count);
+            break;
+        case conn_rand_zipf:
+            *c->cur_key = zipf_sample(&c->rng, c->zipf_t, c->zipf_skew);
+            break;
     }
-    ++*c->write_count;
 }
 
 // adapted from: https://medium.com/@jasoncrease/rejection-sampling-the-zipf-distribution-6b359792cffa
@@ -590,6 +607,9 @@ static int new_connection(struct connection *t)
     // this shouldn't matter and we're not after secure randomization.
     // TODO: Should find some way to make this deterministic.
     pcg32_srandom_r(&c->rng, time(NULL), (intptr_t)c);
+    if (t->rand == conn_rand_zipf) {
+        c->zipf_t = zipf_calc_t(c->key_count, c->zipf_skew);
+    }
 
     error = getaddrinfo(c->host, c->port_num, &hints, &ai);
     if (error != 0) {
@@ -643,7 +663,7 @@ static int new_connection(struct connection *t)
 
     if (c->usleep) {
         // spread out the initial wakeup times
-        long int initsleep = random() % c->usleep;
+        long int initsleep = pcg32_boundedrand_r(&c->rng, c->usleep);
         long int initsleep_s = 0;
         timeval_split(c->usleep, &c->tosleep.tv_sec, &c->tosleep.tv_usec);
         timeval_split(initsleep, &initsleep_s, &initsleep);
@@ -881,6 +901,8 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
         MGET_COUNT,
         VALUE,
         RANDOMIZE,
+        LIVE_RAND,
+        LIVE_RAND_ZIPF,
         STOP_AFTER,
         KEY_COUNT,
         KEY_BLOB_SIZE,
@@ -889,7 +911,8 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
         HOST,
         PORT,
         THREAD,
-        PIPELINES
+        PIPELINES,
+        ZIPF_SKEW
     };
 
     char *const key_options[] = {
@@ -910,6 +933,8 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
         [MGET_COUNT]       = "mget_count",
         [VALUE]            = "value",
         [RANDOMIZE]        = "key_randomize",
+        [LIVE_RAND]        = "live_rand",
+        [LIVE_RAND_ZIPF]   = "live_rand_zipf",
         [STOP_AFTER]       = "stop_after",
         [KEY_COUNT]        = "key_count",
         [KEY_BLOB_SIZE]    = "key_blob_size",
@@ -919,6 +944,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
         [PORT]             = "port",
         [THREAD]           = "thread",
         [PIPELINES]        = "pipelines",
+        [ZIPF_SKEW]        = "zipf_skew",
         NULL
     };
 
@@ -936,6 +962,8 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
     template.key_blob_size = 0;
     template.key_randomize = 0;
     template.key_prealloc = 1;
+    template.rand = conn_rand_off;
+    template.zipf_skew = 0.25; // default to a relatively gentle curve.
     template.pipelines = 1;
     template.expire = 0;
     template.flags = 0;
@@ -1002,6 +1030,12 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
         case RANDOMIZE:
             template.key_randomize = atoi(value);
             break;
+        case LIVE_RAND:
+            template.rand = conn_rand_uniform;
+            break;
+        case LIVE_RAND_ZIPF:
+            template.rand = conn_rand_zipf;
+            break;
         case STOP_AFTER:
             template.stop_after = atoi(value);
             break;
@@ -1033,6 +1067,9 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
             break;
         case PIPELINES:
             template.pipelines = atoi(value);
+            break;
+        case ZIPF_SKEW:
+            template.zipf_skew = strtod(value, NULL);
             break;
         }
     }
