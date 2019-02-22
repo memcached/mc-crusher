@@ -149,6 +149,7 @@ static void client_handler(const int fd, const short which, void *arg);
 static void sleep_handler(const int fd, const short which, void *arg);
 static void setup_thread(mc_thread *t);
 static void create_thread(mc_thread *t);
+static void start_template(struct connection *template, int conns_tomake);
 static inline void run_write(struct connection *c);
 
 static uint32_t zipf_sample(pcg32_random_t *rng, double t, double skew);
@@ -829,16 +830,19 @@ static void prealloc_keys(struct connection *t, const size_t key_blob_size) {
 
     // Make the formatter think it's writing into wbuf.
     t->wbuf_pos = key_blob_ptr;
+    t->cur_key = (uint64_t *)malloc(sizeof(uint64_t));
+    *t->cur_key = 0;
+
     for (i = 0; i < t->key_count; i++) {
         len = t->prealloc_format(t);
         keys[i].key_offset = used;
         keys[i].key_len = len;
         t->wbuf_pos    += len;
         used += len;
-        run_counter(t);
+        *t->cur_key += 1;
     }
+    free(t->cur_key);
     t->wbuf_pos = t->wbuf;
-    *t->cur_key = 0;
 
     t->keys = keys;
     t->key_blob = key_blob;
@@ -876,7 +880,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
     struct connection template;
     int conns_tomake = 1;
     int newsock;
-    int i;
+    int i, x;
     char *tmp;
     char *sender = NULL;
     int add_space = 0;
@@ -970,10 +974,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
     strcpy(template.host, host_default);
     strcpy(template.port_num, port_num_default);
     template.next_state = conn_reading;
-    template.cur_key = (uint64_t *)malloc(sizeof(uint64_t));
-    template.write_count = (uint64_t *)malloc(sizeof(uint64_t));
-    *template.cur_key = 0;
-    *template.write_count = 0;
 
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
@@ -1061,9 +1061,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
             template.usleep = atoi(value);
             break;
         case THREAD:
-            template.t = calloc(1, sizeof(mc_thread));
-            setup_thread(template.t);
-            new_thread = 1;
+            new_thread = atoi(value);
             break;
         case PIPELINES:
             template.pipelines = atoi(value);
@@ -1156,15 +1154,34 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
         return;
     }
 
+    if (new_thread != 0) {
+        // spawn N threads with very similar configurations. allows sharing
+        // the key blob memory.
+        for(x = 0; x < new_thread; x++) {
+            template.t = calloc(1, sizeof(mc_thread));
+            setup_thread(template.t);
+            start_template(&template, conns_tomake);
+            create_thread(template.t);
+        }
+    } else {
+        start_template(&template, conns_tomake);
+    }
+}
+
+static void start_template(struct connection *template, int conns_tomake) {
+    template->cur_key = (uint64_t *)malloc(sizeof(uint64_t));
+    template->write_count = (uint64_t *)malloc(sizeof(uint64_t));
+    // TODO: randomize run counter if conn_rand_off.
+    *template->cur_key = 0;
+    *template->write_count = 0;
+
+    int i, newsock;
     for (i = 0; i < conns_tomake; i++) {
-        newsock = new_connection(&template);
+        newsock = new_connection(template);
         if (newsock < 0) {
-            fprintf(stderr, "Failed to connect: %s[%s]\n", template.host, template.port_num);
+            fprintf(stderr, "Failed to connect: %s[%s]\n", template->host, template->port_num);
             exit(1);
         }
-    }
-    if (new_thread) {
-        create_thread(template.t);
     }
 }
 
@@ -1267,10 +1284,11 @@ int main(int argc, char **argv)
 
     // zipf tester. dumps a bunch of numbers then exits.
     if (zipf_n != 0 && zipf_s != 0) {
+        int x;
         pcg32_random_t rng;
         pcg32_srandom_r(&rng, time(NULL), 54u);
         double zipf_t = zipf_calc_t(zipf_n, zipf_s);
-        for (int x = 0; x < 10000000; x++) {
+        for (x = 0; x < 10000000; x++) {
             fprintf(stdout, "%u\n", zipf_sample(&rng, zipf_t, zipf_s));
         }
         exit(1);
