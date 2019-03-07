@@ -20,10 +20,22 @@ die "$!\n" unless $sock;
 $|++;
 my $data = '1';
 $data = 'x' x $size;
+my @queue = ();
 foreach (1 .. $count) {
-    print $sock "set $prefix${_} 0 $exptime $size noreply\r\n", $data, "\r\n";
+    push(@queue, "set $prefix${_} 0 $exptime $size noreply\r\n$data\r\n");
+    drain(100);
     #scalar <$sock>;
     print "Run: $_\n" if ($_ % int($count / 10) == 0);
 }
+drain(0);
+
+sub drain {
+    my $lim = shift;
+    if (scalar(@queue) > $lim) {
+        print $sock join('', @queue);
+        @queue = ();
+    }
+}
+
 print "\nDone setting\n";
 

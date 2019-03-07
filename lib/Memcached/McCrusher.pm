@@ -97,10 +97,11 @@ sub warm {
     my $p = $a{prefix};
     my $e = $a{exptime} || 0;
     my $f = $a{flags} || 0;
+    my $t = $a{start} || 1;
     my $c = $a{count};
     my $data = 'x' x $s;
 
-    for (1 .. $c) {
+    for ($t .. $c) {
         print $sock "set $p${_} $f $e $s noreply\r\n", $data, "\r\n";
         print "warm: $_\n" if ($_ % int($c / 10) == 0);
     }
@@ -114,6 +115,7 @@ sub warm {
 # TODO: optionally, take a crush config directly
 sub start_crush {
     my $self = shift;
+    my $arg = shift || "";
 
     my $bin = $self->{crush_bin};
     my $config = $self->{crush_config};
@@ -128,10 +130,19 @@ sub start_crush {
     my $ip = $self->{server_ip};
     my $port = $self->{server_port};
 
+    # just need to wait until it's done generating.
+    # TODO: use code below to redirect to output file, but waitpid if
+    # keygen.
+    if ($arg eq "keygen") {
+        print "$bin --conf $cfile --ip $ip --port $port --keygen\n";
+        `$bin --conf $cfile --ip $ip --port $port --keygen`;
+        return;
+    }
+
     my $child = fork();
 
     if ($child) {
-        print "$bin $cfile $ip $port\n";
+        print "$bin --conf $cfile --ip $ip --port $port\n";
         $self->{crush_pid} = $child;
         # try to open output file in loop
         # watch for "done initializing\n"
@@ -155,7 +166,7 @@ sub start_crush {
         # NOTE: If the child doesn't autoflush STDOUT, it can get lost :|
         open(STDOUT, ">", $cout) or die "STDOUT -> $cout: $!";
         open(STDERR, ">&STDOUT", ) or die "STDERR -> STDOUT: $!";
-        exec "$bin $cfile $ip $port";
+        exec "$bin --conf $cfile --ip $ip --port $port";
     }
 }
 

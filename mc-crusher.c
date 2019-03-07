@@ -1133,7 +1133,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
         if (!template.prealloc_format) {
             template.prealloc_format = template.ascii_format;
         }
-        if (key_file != NULL) {
+        if (key_file[0] != 0) {
             have_keys = load_keys(&template, key_file);
         }
 
@@ -1142,7 +1142,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
             prealloc_keys(&template, template.key_blob_size);
         }
 
-        if (!have_keys && key_file != NULL) {
+        if (!have_keys && key_file[0] != 0) {
             write_keys(&template, key_file);
         }
     }
