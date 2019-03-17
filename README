@@ -14,7 +14,7 @@ Usage
 
 Look in the conf/ directory for example configuration files.
 
-$ ./mc-crusher ./conf/loadconf [host] [port]
+$ ./mc-crusher --conf ./conf/loadconf --ip [ip] --port [port]
 defaults:
 host: 127.0.0.1
 port: 11211
@@ -22,22 +22,44 @@ port: 11211
 Running
 -------
 
-This tool is extremely rough.
-
-First, run it for a few seconds with a config like "conf/loadconf", this will
-seed the instance with some values to fetch later. Now, kill it.
-
-You can also use the bench-warmer.pl tool to preload some keys.
+You can also use the bench-warmer.pl tool to preload some keys. mc-crusher
+makes no attempt to recache anything on a miss.
 
 Pick a config file, and start it as above. You should start a fresh memcached,
 and run the "sample" script that comes with mc-crusher. mc-crusher makes no
-attempt to care about what it does. It flails tiredlessly against the fanged
-defenses of the cache daemon.
+attempt to read response data in order to maximize efficiency.
 
 Modify bench-sample to print what you are most interested in examining.
 
-You can change the "default" destination ip/port by adding extra arguments:
-$ ./mc-crusher ./conf/loadconf 192.168.1.1 11211
+The latency-sampler utility included is used to measure response latency
+during a test. You must run it yourself, either after a warmup period or at
+the same time as a test.
+
+Start options
+-------------
+
+--conf [file]
+ - the test configuration to load/run.
+
+--ip [127.0.0.1]
+ - IP address to connect to.
+
+--port [11211]
+ - port to connect to.
+
+--timeout [seconds]
+ - stop the test after this amount of time
+
+--keygen
+ - exit after pre-generating any key files from the configuration.
+
+--zipf-n
+--zipf-s
+ - Commands which will dump a curve from the supplied zipf arguments (N being
+   limit, S being curve skew (0.00-2.00 useful range).
+ - Exits after dumping 10 million key:frequency ratios.
+ - Used for tuning zipf arguments in a config file. High skew gives "hot
+   keys". Low skew gives a more gentle curve.
 
 Configuration
 -------------
@@ -93,6 +115,32 @@ after. the sleep is per-connection (so conns=2 will write twice per usleep)
 
 stop_after : stop all conns for this test after N writes have been made.
 
+pipelines : stack this many requests into the same syscall. Useful for
+reducing some syscall overhead for some types of tests.
+
+key_file : dumps files with .idx and .blob extensions after this specified
+filename when used with key_prealloc=1. Allows pre-generating/shuffling keys
+for iterations of tests. Note this doesn't presently validate the files are
+valid before use, so you must ensure to delete them if a configuration
+changes.
+
+thread : number of threads to spawn with the same configuration. This means if
+conns=1,thread=4 there will be four total connections made. This also shares
+pre-generated key blobs, reducing memory required and start time for tests
+with a large set of keys.
+
+live_rand : if set to 1, will use embedded PCG randomizer to choose keys. Can
+be used with key_prealloc without key_randomize to generate a more randomized
+uniform workload at a small cost to CPU performance (10-15%)
+
+live_rand_zipf : if set to 1, paired with zipf_skew, will choose a key
+randomizer which skews according to a zipf distribution (ie; keys early in the
+list have a higher use bias).
+
+zipf_skew : typically 0.01 to 2.00 in range. Higher skews create hot-key
+scenarios, where a bulk of accesses are a handful of keys. Lower skews are
+useful for creating somewhat realistic workloads of hot vs not as hot keys.
+
 Caveats
 -------
 
@@ -116,28 +164,12 @@ A short list of things I intend to change or add:
 
 - Fix the command generators to have a *little* error handling
 
-- Switch to writev and use iovectors + pregenerated keys for almost everything
-
-- Add back some routines which are sprintf only, for doing tests with
-  extremely wide keyspaces where performance is less of an issue.
-
-- Add a "run_every" option which fires a conn every N microseconds instead of
-  endlessly.
-
-- Add a "timer" option which times the commands it runs and periodically dumps
-  a histogram of response times. Mainly to be used with "run_every"
-
 - Add missing protocol commands. *_incr, *_decr, *_delete, etc.
-
-- Make the iteration loop per-connection, and randomizeable.
 
 - Add commands to iterate over different value sizes
 
-- Add multithreading to ease management.
-
-- Allow running timer conns in their own thread (or just define if a conn
-  template should use a thread, then define conns=1?)
-
 - Bundle a better perl util for printing stats
 
-- Write/bundle a better util for running iterative benchmarks.
+- Client flags and expiration times
+
+- ASCII noreply
