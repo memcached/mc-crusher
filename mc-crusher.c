@@ -1004,6 +1004,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     template.flags = 0;
     strcpy(template.host, host_default);
     strcpy(template.port_num, port_num_default);
+    key_file[0] = 0;
     template.next_state = conn_reading;
 
     /* Chomp the ending newline */
