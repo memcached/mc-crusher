@@ -15,6 +15,7 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <event.h>
@@ -48,9 +49,12 @@
 
 #define SHARED_RBUF_SIZE 1024 * 64
 #define SHARED_VALUE_SIZE 1024 * 1024
+// avoiding some hacks for finding member size.
+#define SOCK_MAX 100
 
 char host_default[NI_MAXHOST] = "127.0.0.1";
 char port_num_default[NI_MAXSERV] = "11211";
+char sock_path_default[SOCK_MAX];
 int alarm_fired = 0;
 
 enum conn_states {
@@ -149,7 +153,7 @@ static void client_handler(const int fd, const short which, void *arg);
 static void sleep_handler(const int fd, const short which, void *arg);
 static void setup_thread(mc_thread *t);
 static void create_thread(mc_thread *t);
-static void start_template(struct connection *template, int conns_tomake);
+static void start_template(struct connection *template, int conns_tomake, bool use_sock);
 static inline void run_write(struct connection *c);
 
 static uint32_t zipf_sample(pcg32_random_t *rng, double t, double skew);
@@ -590,13 +594,14 @@ static void timeval_split(const uint64_t in, long int *outs, long int *outu) {
     }
 }
 
-static int new_connection(struct connection *t)
+static int new_connection(struct connection *t, char *sock_path)
 {
     int sock;
     struct addrinfo *ai;
     struct addrinfo *ai_next;
     struct addrinfo hints = { .ai_flags = AI_PASSIVE,
                               .ai_family = AF_UNSPEC };
+    struct sockaddr_un un_addr;
     int flags = 1;
     int error;
     struct connection *c = (struct connection *)malloc(sizeof(struct connection));
@@ -612,52 +617,78 @@ static int new_connection(struct connection *t)
         c->zipf_t = zipf_calc_t(c->key_count, c->zipf_skew);
     }
 
-    error = getaddrinfo(c->host, c->port_num, &hints, &ai);
-    if (error != 0) {
-        if (error != EAI_SYSTEM) {
-            fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
-        } else {
-            perror("getaddrinfo()");
+    if (sock_path == NULL) {
+        error = getaddrinfo(c->host, c->port_num, &hints, &ai);
+        if (error != 0) {
+            if (error != EAI_SYSTEM) {
+                fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
+            } else {
+                perror("getaddrinfo()");
+            }
+            freeaddrinfo(ai);
+            return -1;
         }
-        freeaddrinfo(ai);
-        return -1;
-    }
 
-    for (ai_next = ai; ai_next; ai_next = ai_next->ai_next) {
-        sock = socket(ai_next->ai_family, ai_next->ai_socktype, ai_next->ai_protocol);
-        if (sock == -1) {
-            perror("socket");
-            continue;
-        } else {
-            break;
+        for (ai_next = ai; ai_next; ai_next = ai_next->ai_next) {
+            sock = socket(ai_next->ai_family, ai_next->ai_socktype, ai_next->ai_protocol);
+            if (sock == -1) {
+                perror("socket");
+                continue;
+            } else {
+                break;
+            }
         }
-    }
 
-    if (sock < 0) {
-        fprintf(stderr, "getaddrinfo failed to provide any valid addresses: %s[%s]\n",
-                c->host, c->port_num);
-        freeaddrinfo(ai);
-        return -1;
-    }
+        if (sock < 0) {
+            fprintf(stderr, "getaddrinfo failed to provide any valid addresses: %s[%s]\n",
+                    c->host, c->port_num);
+            freeaddrinfo(ai);
+            return -1;
+        }
 
-    if ( (flags = fcntl(sock, F_GETFL, 0)) < 0 ||
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
-        close(sock);
-        freeaddrinfo(ai);
-        return -1;
-    }
-
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
-
-    if (connect(sock, ai_next->ai_addr, ai_next->ai_addrlen) == -1) {
-        if (errno != EINPROGRESS) {
+        if ( (flags = fcntl(sock, F_GETFL, 0)) < 0 ||
+            fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
             close(sock);
             freeaddrinfo(ai);
             return -1;
         }
+
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
+
+        if (connect(sock, ai_next->ai_addr, ai_next->ai_addrlen) == -1) {
+            if (errno != EINPROGRESS) {
+                close(sock);
+                freeaddrinfo(ai);
+                return -1;
+            }
+        }
+
+        freeaddrinfo(ai);
+    } else {
+        sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sock == -1) {
+            perror("socket");
+            return -1;
+        }
+
+        if ( (flags = fcntl(sock, F_GETFL, 0)) < 0 ||
+            fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+            close(sock);
+            return -1;
+        }
+
+        memset(&un_addr, 0, sizeof(un_addr));
+        un_addr.sun_family = AF_UNIX;
+        strncpy(un_addr.sun_path, sock_path, SOCK_MAX-1);
+        if (connect(sock, (struct sockaddr *)&un_addr, sizeof(un_addr)) == -1) {
+            if (errno != EINPROGRESS) {
+                close(sock);
+                perror("Failed to connect to unix socket");
+                return -1;
+            }
+        }
     }
 
-    freeaddrinfo(ai);
     c->fd = sock;
     c->state = conn_connecting;
     c->ev_flags = EV_WRITE;
@@ -672,7 +703,7 @@ static int new_connection(struct connection *t)
         evtimer_set(&c->ev, sleep_handler, (void *)c);
         event_base_set(c->t->base, &c->ev);
         evtimer_add(&c->ev, &t);
-    } else{
+    } else {
         event_set(&c->ev, sock, c->ev_flags, client_handler, (void *)c);
         event_base_set(c->t->base, &c->ev);
         event_add(&c->ev, NULL);
@@ -875,7 +906,7 @@ static void prealloc_keys(struct connection *t, const size_t key_blob_size) {
 }
 
 /* Get a little verbose to avoid a big if/else if tree */
-static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
+static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, bool use_sock) {
     char *in_progress, *token;
     struct connection template;
     int conns_tomake = 1;
@@ -1160,15 +1191,15 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen) {
         for(x = 0; x < new_thread; x++) {
             template.t = calloc(1, sizeof(mc_thread));
             setup_thread(template.t);
-            start_template(&template, conns_tomake);
+            start_template(&template, conns_tomake, use_sock);
             create_thread(template.t);
         }
     } else {
-        start_template(&template, conns_tomake);
+        start_template(&template, conns_tomake, use_sock);
     }
 }
 
-static void start_template(struct connection *template, int conns_tomake) {
+static void start_template(struct connection *template, int conns_tomake, bool use_sock) {
     template->cur_key = (uint64_t *)malloc(sizeof(uint64_t));
     template->write_count = (uint64_t *)malloc(sizeof(uint64_t));
     // TODO: randomize run counter if conn_rand_off.
@@ -1177,9 +1208,17 @@ static void start_template(struct connection *template, int conns_tomake) {
 
     int i, newsock;
     for (i = 0; i < conns_tomake; i++) {
-        newsock = new_connection(template);
+        if (use_sock) {
+            newsock = new_connection(template, (char *)&sock_path_default);
+        } else {
+            newsock = new_connection(template, NULL);
+        }
         if (newsock < 0) {
-            fprintf(stderr, "Failed to connect: %s[%s]\n", template->host, template->port_num);
+            if (use_sock) {
+                fprintf(stderr, "Failed to connect: %s\n", sock_path_default);
+            } else {
+                fprintf(stderr, "Failed to connect: %s[%s]\n", template->host, template->port_num);
+            }
             exit(1);
         }
     }
@@ -1224,6 +1263,7 @@ int main(int argc, char **argv)
     char line[4096];
     int timeout = 0;
     bool keygen = false; // exit after reading configuration.
+    bool use_sock = false;
     double zipf_s = 0;
     int zipf_n = 0;
     // kill buffering of stdout so a parent process can monitor it.
@@ -1236,6 +1276,8 @@ int main(int argc, char **argv)
         // standard operational options
         {"ip", required_argument, 0, 'i'},
         {"port", required_argument, 0, 'p'},
+        // connect instead to a unix socket
+        {"sock", required_argument, 0, 's'},
         {"conf", required_argument, 0, 'c'},
         {"timeout", required_argument, 0, 't'},
         // keygen mode. exits after generating key files.
@@ -1257,6 +1299,11 @@ int main(int argc, char **argv)
         case 'p':
             strncpy(port_num_default, optarg, NI_MAXSERV);
             printf("port default: %s\n", port_num_default);
+            break;
+        case 's':
+            strncpy(sock_path_default, optarg, SOCK_MAX-1);
+            printf("unix socket path: %s\n", sock_path_default);
+            use_sock = true;
             break;
         case 'c':
             cfd = fopen(optarg, "r");
@@ -1300,7 +1347,7 @@ int main(int argc, char **argv)
     }
 
     while (fgets(line, 4096, cfd) != NULL) {
-        parse_config_line(main_thread, line, keygen);
+        parse_config_line(main_thread, line, keygen, use_sock);
     }
     fclose(cfd);
 
