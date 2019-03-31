@@ -46,6 +46,7 @@
 
 #include "protocol_binary.h"
 #include "pcg-basic.h"
+#include "itoa_ljust.h"
 
 #define SHARED_RBUF_SIZE 1024 * 64
 #define SHARED_VALUE_SIZE 1024 * 1024
@@ -82,9 +83,21 @@ typedef struct _mc_thread {
     unsigned char *shared_rbuf;
 } mc_thread;
 
+// data shared within a single template.
+// a thread can have multiple templates in it, so key_prefix/value can't be
+// part of mc_thread.
+// TODO: Move more of the static values in here. counts/etc.
+typedef struct _mc_tshared {
+    size_t key_prefix_len;
+    unsigned char key_prefix[250];
+    unsigned char value[2048];     /* manually specified seed value */
+} mc_tshared;
+
 struct connection {
     /* Owner thread */
     mc_thread *t;
+    /* some same-template shared data */
+    mc_tshared *s;
 
     /* host */
     char host[NI_MAXHOST];
@@ -99,10 +112,8 @@ struct connection {
 
     /* Counters, bits, flags for individual senders/getters. */
     int mget_count;                /* # of ascii mget keys to send at once */
-    unsigned char key_prefix[240];
     int value_size;
     int use_shared_value;
-    unsigned char value[2048];     /* manually specified seed value */
     int buf_written;
     int buf_towrite;
     uint32_t expire;
@@ -120,7 +131,6 @@ struct connection {
     int      key_prealloc;
     struct mc_key *keys; // pointers into key_blob.
     unsigned char *key_blob;
-    unsigned char wbuf[65536];
     unsigned char *wbuf_pos;
 
     /* random number handling */
@@ -147,6 +157,7 @@ struct connection {
     int (*bin_format)(struct connection *c);
     void (*bin_prep_cmd)(struct connection *c);
     int (*prealloc_format)(struct connection *c);
+    unsigned char wbuf[65536]; // putting this at the end to get more of the above into fewer cachelines.
 };
 
 static void client_handler(const int fd, const short which, void *arg);
@@ -317,8 +328,10 @@ static double zipf_calc_t(uint32_t n, double skew) {
 /* === BINARY PROTOCOL === */
 
 static int bin_key_format(struct connection *c) {
-    return sprintf(c->wbuf_pos, "%s%llu", c->key_prefix,
-            (unsigned long long)*c->cur_key);
+    char *p = c->wbuf_pos;
+    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    return (p - (char *)c->wbuf_pos);
 }
 
 // can generalize this a bit further.
@@ -413,7 +426,7 @@ static void bin_write_to_client(void *arg) {
         if (c->use_shared_value) {
             vecs[c->iov_used].iov_base = c->t->shared_value;
         } else {
-            vecs[c->iov_used].iov_base = c->value;
+            vecs[c->iov_used].iov_base = c->s->value;
         }
         vecs[c->iov_used].iov_len = c->value_size;
         c->iov_used++;
@@ -425,8 +438,11 @@ static void bin_write_to_client(void *arg) {
 /* === ASCII PROTOCOL TESTS === */
 
 static int ascii_mget_format(struct connection *c) {
-    return sprintf(c->wbuf_pos, "%s%llu ", c->key_prefix,
-            (unsigned long long)*c->cur_key);
+    char *p = c->wbuf_pos;
+    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    *p = ' ';
+    return (p - (char *)c->wbuf_pos) + 1;
 }
 
 /* Multigets have a weird/specific format. */
@@ -443,38 +459,72 @@ static void ascii_write_mget_to_client(void *arg) {
         } else {
             vecs[i].iov_base = c->wbuf_pos;
             vecs[i].iov_len  = ascii_mget_format(c);
+            c->wbuf_pos += vecs[i].iov_len;
         }
         run_counter(c);
     }
     vecs[i].iov_base = "\r\n";
     vecs[i].iov_len  = 2;
+    c->iov_used = i;
 }
 
 static int ascii_set_format(struct connection *c) {
-    int ret = 0;
-    ret = sprintf(c->wbuf_pos, "set %s%llu %u %u %d\r\n", c->key_prefix,
-            (unsigned long long)*c->cur_key, c->flags, c->expire, c->value_size);
-    return ret;
+    char *p = c->wbuf_pos;
+    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    *p = ' ';
+    p = itoa_u32(c->flags, p+1);
+    *p = ' ';
+    p = itoa_u32(c->expire, p+1);
+    *p = ' ';
+    p = itoa_u32(c->value_size, p+1);
+    *p = '\r';
+    *(p+1) = '\n';
+    return (p - (char *)c->wbuf_pos) + 2;
 }
 
 static int ascii_incr_format(struct connection *c) {
-    return sprintf(c->wbuf_pos, "incr %s%llu 1\r\n", c->key_prefix,
-                (unsigned long long)*c->cur_key);
+    char *p = c->wbuf_pos;
+    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    *p = ' ';
+    *(p+1) = '1';
+    *(p+2) = '\r';
+    *(p+3) = '\n';
+    return (p - (char *)c->wbuf_pos) + 4;
 }
 
+// FIXME: redundant with incr now?
 static int ascii_decr_format(struct connection *c) {
-    return sprintf(c->wbuf_pos, "decr %s%llu 1\r\n", c->key_prefix,
-                (unsigned long long)*c->cur_key);
+    char *p = c->wbuf_pos;
+    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    *p = ' ';
+    *(p+1) = '1';
+    *(p+2) = '\r';
+    *(p+3) = '\n';
+    return (p - (char *)c->wbuf_pos) + 4;
 }
 
 static int ascii_get_format(struct connection *c) {
-    return sprintf(c->wbuf_pos, "get %s%llu\r\n", c->key_prefix,
-                (unsigned long long)*c->cur_key);
+    char *p = c->wbuf_pos;
+    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    *p = ' ';
+    *(p+1) = '\r';
+    *(p+2) = '\n';
+    return (p - (char *)c->wbuf_pos) + 3;
 }
 
+// FIXME: redundant with get?
 static int ascii_delete_format(struct connection *c) {
-    return sprintf(c->wbuf_pos, "delete %s%llu\r\n", c->key_prefix,
-                (unsigned long long)*c->cur_key);
+    char *p = c->wbuf_pos;
+    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    *p = ' ';
+    *(p+1) = '\r';
+    *(p+2) = '\n';
+    return (p - (char *)c->wbuf_pos) + 3;
 }
 
 static void ascii_write_to_client(void *arg) {
@@ -493,7 +543,7 @@ static void ascii_write_to_client(void *arg) {
         if (c->use_shared_value) {
             vecs[c->iov_used].iov_base = c->t->shared_value;
         } else {
-            vecs[c->iov_used].iov_base = c->value;
+            vecs[c->iov_used].iov_base = c->s->value;
         }
         vecs[c->iov_used].iov_len = c->value_size;
         c->iov_used++;
@@ -916,6 +966,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     char *sender = NULL;
     int add_space = 0;
     int new_thread = 0;
+    char key_prefix_tmp[270];
     char key_file[1024];
 
     enum {
@@ -986,11 +1037,10 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
 
     memset(&template, 0, sizeof(struct connection));
     /* Set defaults into template */
-    strcpy(template.key_prefix, "foo");
+    strcpy(key_prefix_tmp, "foo");
     template.t = main_thread;
     template.mget_count = 2;
     template.value_size = 0;
-    template.value[0] = '\0';
     template.use_shared_value = 1;
     template.buf_written = 0;
     template.key_count = 200000;
@@ -1006,6 +1056,8 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     strcpy(template.port_num, port_num_default);
     key_file[0] = 0;
     template.next_state = conn_reading;
+    template.s = calloc(1, sizeof(mc_tshared));
+    template.s->value[0] = '\0';
 
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
@@ -1046,7 +1098,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
             template.flags = atoi(value);
             break;
         case KEY_PREFIX:
-            strcpy(template.key_prefix, value);
+            strcpy(key_prefix_tmp, value);
             break;
         case MGET_COUNT:
             template.mget_count = atoi(value);
@@ -1055,7 +1107,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
             template.value_size = atoi(value);
             break;
         case VALUE:
-            strcpy(template.value, value);
+            strcpy(template.s->value, value);
             template.value_size = strlen(value);
             template.use_shared_value = 0;
             break;
@@ -1108,57 +1160,70 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     if (strcmp(sender, "ascii_get") == 0) {
         template.writer = ascii_write_to_client;
         template.ascii_format = ascii_get_format;
+        sprintf(template.s->key_prefix, "get %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_set") == 0) {
         template.writer = ascii_write_to_client;
         template.ascii_format = ascii_set_format;
         template.iov_count = 3;
+        sprintf(template.s->key_prefix, "set %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_mget") == 0) {
         template.writer = ascii_write_mget_to_client;
         template.iov_count = template.mget_count + 2;
         template.prealloc_format = ascii_mget_format;
+        sprintf(template.s->key_prefix, "%s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_incr") == 0) {
         template.writer = ascii_write_to_client;
         template.ascii_format = ascii_incr_format;
+        sprintf(template.s->key_prefix, "incr %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_delete") == 0) {
         template.writer = ascii_write_to_client;
         template.ascii_format = ascii_delete_format;
+        sprintf(template.s->key_prefix, "delete %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_decr") == 0) {
         template.writer = ascii_write_to_client;
         template.ascii_format = ascii_decr_format;
+        sprintf(template.s->key_prefix, "decr %s", key_prefix_tmp);
     } else if (strcmp(sender, "bin_get") == 0) {
         template.writer = bin_write_to_client;
         template.bin_prep_cmd = bin_prep_get;
         template.bin_format = bin_key_format;
         template.prealloc_format = bin_key_format;
         template.iov_count = 2;
+        strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_getq") == 0) {
         template.writer = bin_write_to_client;
         template.bin_prep_cmd = bin_prep_getq;
         template.bin_format = bin_key_format;
         template.prealloc_format = bin_key_format;
         template.iov_count = 2;
+        strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_set") == 0) {
         template.writer = bin_write_to_client;
         template.bin_prep_cmd = bin_prep_set;
         template.bin_format = bin_key_format;
         template.prealloc_format = bin_key_format;
         template.iov_count = 3;
+        strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_setq") == 0) {
         template.writer = bin_write_to_client;
         template.bin_prep_cmd = bin_prep_setq;
         template.bin_format = bin_key_format;
         template.prealloc_format = bin_key_format;
         template.iov_count = 3;
+        strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_touch") == 0) {
         template.writer = bin_write_to_client;
         template.bin_prep_cmd = bin_prep_touch;
         template.bin_format = bin_key_format;
         template.prealloc_format = bin_key_format;
         template.iov_count = 2;
+        strcpy(template.s->key_prefix, key_prefix_tmp);
     } else {
         fprintf(stderr, "Unknown command writer: %s\n", sender);
         exit(1);
     }
+
+    template.s->key_prefix_len = strlen(template.s->key_prefix);
 
     if (template.key_prealloc) {
         bool have_keys = false;
@@ -1189,7 +1254,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     if (new_thread != 0) {
         // spawn N threads with very similar configurations. allows sharing
         // the key blob memory.
-        for(x = 0; x < new_thread; x++) {
+        for (x = 0; x < new_thread; x++) {
             template.t = calloc(1, sizeof(mc_thread));
             setup_thread(template.t);
             start_template(&template, conns_tomake, use_sock);
