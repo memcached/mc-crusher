@@ -114,8 +114,8 @@ struct connection {
     int mget_count;                /* # of ascii mget keys to send at once */
     int value_size;
     int use_shared_value;
-    int buf_written;
-    int buf_towrite;
+    int wbuf_written;
+    int wbuf_towrite;
     uint32_t expire;
     uint32_t flags;
 
@@ -155,7 +155,7 @@ struct connection {
     /* helper function specific to the generic ascii writer */
     int (*ascii_format)(struct connection *c);
     int (*bin_format)(struct connection *c);
-    void (*bin_prep_cmd)(struct connection *c);
+    int (*bin_prep_cmd)(struct connection *c);
     int (*prealloc_format)(struct connection *c);
     unsigned char wbuf[65536]; // putting this at the end to get more of the above into fewer cachelines.
 };
@@ -274,6 +274,40 @@ static inline int sum_iovecs(const struct iovec *vecs, const int iov_count) {
     return sum;
 }
 
+static void write_flat(struct connection *c, enum conn_states next_state) {
+    int written = 0;
+    written = write(c->fd, c->wbuf + c->wbuf_written, c->wbuf_towrite);
+    if (written == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
+            // the sender always checks for reads. not necessary to change?
+            c->state = conn_sending;
+            return;
+        } else {
+            perror("Write error to client");
+            exit(1);
+            return;
+        }
+    }
+
+    c->wbuf_towrite -= written;
+    if (c->wbuf_towrite > 0) {
+        update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
+        //fprintf(stderr, "Draining flat buffer %d by (%d)\n", c->wbuf_towrite, written);
+        c->wbuf_written += written;
+        c->state = conn_sending;
+    } else {
+        c->state = next_state;
+        if (c->state == conn_reading) {
+            update_conn_event(c, EV_READ | EV_PERSIST);
+        } else if (c->state == conn_sending) {
+            update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
+        } else if (c->state == conn_sleeping) {
+            update_conn_event_sleep(c);
+        }
+    }
+}
+
 static inline void run_counter(struct connection *c) {
     ++*c->write_count; // for limiting requests in a particular test
     switch (c->rand) {
@@ -335,68 +369,93 @@ static int bin_key_format(struct connection *c) {
 }
 
 // can generalize this a bit further.
-static void bin_prep_getq(struct connection *c) {
+static int bin_prep_getq(struct connection *c) {
     protocol_binary_request_get *pkt = (protocol_binary_request_get *)c->wbuf_pos;
     pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_GETQ;
 
-    struct iovec *vecs = c->vecs;
-    int i = c->iov_used;
-    vecs[i].iov_base = c->wbuf_pos;
-    vecs[i].iov_len  = sizeof(protocol_binary_request_get);
-    c->wbuf_pos += vecs[i].iov_len;
-    c->iov_used++;
+    int l = sizeof(protocol_binary_request_get);
+    if (c->key_prealloc) {
+        struct iovec *vecs = c->vecs;
+        int i = c->iov_used;
+        vecs[i].iov_base = c->wbuf_pos;
+        vecs[i].iov_len  = l;
+        c->wbuf_pos += vecs[i].iov_len;
+        c->iov_used++;
+    } else {
+        c->wbuf_pos += l;
+    }
+    return l;
 }
 
-static void bin_prep_get(struct connection *c) {
+static int bin_prep_get(struct connection *c) {
     protocol_binary_request_get *pkt = (protocol_binary_request_get *)c->wbuf_pos;
     pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_GET;
 
-    struct iovec *vecs = c->vecs;
-    int i = c->iov_used;
-    vecs[i].iov_base = c->wbuf_pos;
-    vecs[i].iov_len  = sizeof(protocol_binary_request_get);
-    c->wbuf_pos += vecs[i].iov_len;
-    c->iov_used++;
+    int l = sizeof(protocol_binary_request_get);
+    if (c->key_prealloc) {
+        struct iovec *vecs = c->vecs;
+        int i = c->iov_used;
+        vecs[i].iov_base = c->wbuf_pos;
+        vecs[i].iov_len  = l;
+        c->wbuf_pos += vecs[i].iov_len;
+        c->iov_used++;
+    } else {
+        c->wbuf_pos += l;
+    }
+    return l;
 }
 
-static void bin_prep_set(struct connection *c) {
+static int bin_prep_set(struct connection *c) {
     protocol_binary_request_set *pkt = (protocol_binary_request_set *)c->wbuf_pos;
     pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_SET;
     pkt->message.header.request.extlen = 8; /* flags + exptime */
     pkt->message.body.flags = htonl(c->flags);
     pkt->message.body.expiration = htonl(c->expire);
 
-    struct iovec *vecs = c->vecs;
-    int i = c->iov_used;
-    vecs[i].iov_base = c->wbuf_pos;
-    vecs[i].iov_len  = sizeof(protocol_binary_request_header) + 8;
-    c->wbuf_pos += vecs[i].iov_len;
-    c->iov_used++;
+    int l = sizeof(protocol_binary_request_header) + 8;
+    if (c->key_prealloc) {
+        struct iovec *vecs = c->vecs;
+        int i = c->iov_used;
+        vecs[i].iov_base = c->wbuf_pos;
+        vecs[i].iov_len  = l;
+        c->wbuf_pos += vecs[i].iov_len;
+        c->iov_used++;
+    } else {
+        c->wbuf_pos += l;
+    }
+    return l;
 }
 
 /* slightly crazy; since bin_prep_set changes wbuf_pos create the packet
  * pointer first, run original prep, then switch the command out.
  */
-static void bin_prep_setq(struct connection *c) {
+static int bin_prep_setq(struct connection *c) {
     protocol_binary_request_set *pkt = (protocol_binary_request_set *)c->wbuf_pos;
-    bin_prep_set(c);
+    int l = bin_prep_set(c);
     pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_SETQ;
     // Continue to send since we don't expect to read anything.
     c->next_state = conn_sending;
+    return l;
 }
 
-static void bin_prep_touch(struct connection *c) {
+static int bin_prep_touch(struct connection *c) {
     protocol_binary_request_touch *pkt = (protocol_binary_request_touch *)c->wbuf_pos;
     pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_TOUCH;
     pkt->message.header.request.extlen = 4; /* exptime */
     pkt->message.body.expiration = htonl(c->expire);
 
-    struct iovec *vecs = c->vecs;
-    int i = c->iov_used;
-    vecs[i].iov_base = c->wbuf_pos;
-    vecs[i].iov_len  = sizeof(protocol_binary_request_header) + 4;
-    c->wbuf_pos += vecs[i].iov_len;
-    c->iov_used++;
+    int l = sizeof(protocol_binary_request_header) + 4;
+    if (c->key_prealloc) {
+        struct iovec *vecs = c->vecs;
+        int i = c->iov_used;
+        vecs[i].iov_base = c->wbuf_pos;
+        vecs[i].iov_len  = l;
+        c->wbuf_pos += vecs[i].iov_len;
+        c->iov_used++;
+    } else {
+        c->wbuf_pos += l;
+    }
+    return l;
 }
 
 /* Unhappy with this, but it's still shorter/better than the old code.
@@ -435,6 +494,33 @@ static void bin_write_to_client(void *arg) {
     run_counter(c);
 }
 
+static void bin_write_flat_to_client(void *arg) {
+    struct connection *c = arg;
+    protocol_binary_request_header *pkt = (protocol_binary_request_header *)c->wbuf_pos;
+    memset(pkt, 0, sizeof(protocol_binary_request_header));
+    pkt->request.magic = PROTOCOL_BINARY_REQ;
+
+    c->bin_prep_cmd(c);
+    // FIXME: move wbuf_pos here instead of in the func.
+    int keylen = c->bin_format(c);
+    c->wbuf_pos += keylen;
+    int bodylen = keylen + pkt->request.extlen;
+    pkt->request.keylen = htons(keylen);
+
+    if (c->value_size) {
+        bodylen += c->value_size;
+        if (c->use_shared_value) {
+            memcpy(c->wbuf_pos, c->t->shared_value, c->value_size);
+        } else {
+            memcpy(c->wbuf_pos, c->s->value, c->value_size);
+        }
+        c->wbuf_pos += c->value_size;
+    }
+
+    pkt->request.bodylen = htonl(bodylen);
+    run_counter(c);
+}
+
 /* === ASCII PROTOCOL TESTS === */
 
 static int ascii_mget_format(struct connection *c) {
@@ -468,6 +554,22 @@ static void ascii_write_mget_to_client(void *arg) {
     c->iov_used = i;
 }
 
+static void ascii_write_flat_mget_to_client(void *arg) {
+    struct connection *c = arg;
+    int i;
+    memcpy(c->wbuf_pos, "get ", 4);
+    c->wbuf_pos += 4;
+
+    for (i = 0; i < c->mget_count; i++) {
+        c->wbuf_pos += ascii_mget_format(c);
+        run_counter(c);
+    }
+
+    c->wbuf_pos[0] = '\r';
+    c->wbuf_pos[1] = '\n';
+    c->wbuf_pos += 2;
+}
+
 static int ascii_set_format(struct connection *c) {
     char *p = c->wbuf_pos;
     memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
@@ -483,7 +585,7 @@ static int ascii_set_format(struct connection *c) {
     return (p - (char *)c->wbuf_pos) + 2;
 }
 
-static int ascii_incr_format(struct connection *c) {
+static int ascii_incrdecr_format(struct connection *c) {
     char *p = c->wbuf_pos;
     memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
     p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
@@ -494,30 +596,8 @@ static int ascii_incr_format(struct connection *c) {
     return (p - (char *)c->wbuf_pos) + 4;
 }
 
-// FIXME: redundant with incr now?
-static int ascii_decr_format(struct connection *c) {
-    char *p = c->wbuf_pos;
-    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
-    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
-    *p = ' ';
-    *(p+1) = '1';
-    *(p+2) = '\r';
-    *(p+3) = '\n';
-    return (p - (char *)c->wbuf_pos) + 4;
-}
-
-static int ascii_get_format(struct connection *c) {
-    char *p = c->wbuf_pos;
-    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
-    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
-    *p = ' ';
-    *(p+1) = '\r';
-    *(p+2) = '\n';
-    return (p - (char *)c->wbuf_pos) + 3;
-}
-
-// FIXME: redundant with get?
-static int ascii_delete_format(struct connection *c) {
+// get, delete, and so on.
+static int ascii_single_format(struct connection *c) {
     char *p = c->wbuf_pos;
     memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
     p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
@@ -552,6 +632,24 @@ static void ascii_write_to_client(void *arg) {
         c->iov_used++;
     }
     run_counter(c);
+}
+
+// for fast-writing to wbuf
+// WARNING: sets can easily blow this up :(
+static void ascii_write_flat_to_client(void *arg) {
+    struct connection *c = arg;
+    c->wbuf_pos += c->ascii_format(c);
+    if (c->value_size) {
+        if (c->use_shared_value) {
+            memcpy(c->wbuf_pos, c->t->shared_value, c->value_size);
+        } else {
+            memcpy(c->wbuf_pos, c->s->value, c->value_size);
+        }
+        c->wbuf_pos += c->value_size;
+        c->wbuf_pos[0] = '\r';
+        c->wbuf_pos[1] = '\n';
+        c->wbuf_pos += 2;
+    }
 }
 
 /* === READERS === */
@@ -589,8 +687,16 @@ static inline void run_write(struct connection *c) {
     for (i = 0; i < c->pipelines; i++) {
         c->writer(c);
     }
-    c->iov_towrite = sum_iovecs(c->vecs, c->iov_used);
-    write_iovecs(c, c->next_state);
+    if (c->iov_used) {
+        c->iov_towrite = sum_iovecs(c->vecs, c->iov_used);
+        write_iovecs(c, c->next_state);
+    } else {
+        // not using iovecs, save some libc/kernel looping.
+        c->wbuf_towrite = c->wbuf_pos - (unsigned char *)&c->wbuf;
+        c->wbuf_written = 0;
+        //fprintf(stderr, "WBUF towrite: %d\n", c->wbuf_towrite);
+        write_flat(c, c->next_state);
+    }
     if (c->stop_after && *c->write_count >= c->stop_after) {
         event_del(&c->ev);
     }
@@ -617,9 +723,13 @@ static void client_handler(const int fd, const short which, void *arg) {
             c->reader(c);
         }
         if (which & EV_WRITE) {
-            if (c->iov_towrite > 0)
+            if (c->iov_towrite > 0) {
                 write_iovecs(c, c->next_state);
-            if (c->iov_towrite <= 0) {
+            } else if (c->wbuf_towrite) {
+                write_flat(c, c->next_state);
+            }
+
+            if (c->iov_towrite <= 0 && c->wbuf_towrite == 0) {
                 run_write(c);
             }
         }
@@ -627,7 +737,7 @@ static void client_handler(const int fd, const short which, void *arg) {
     case conn_reading:
         c->reader(c);
         c->state = conn_sending;
-        if (c->iov_towrite <= 0)
+        if (c->iov_towrite <= 0 && c->wbuf_towrite <= 0)
             run_write(c);
         break;
     }
@@ -1042,11 +1152,12 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     template.mget_count = 2;
     template.value_size = 0;
     template.use_shared_value = 1;
-    template.buf_written = 0;
+    template.wbuf_written = 0;
+    template.wbuf_towrite = 0;
     template.key_count = 200000;
     template.key_blob_size = 0;
     template.key_randomize = 0;
-    template.key_prealloc = 1;
+    template.key_prealloc = 0;
     template.rand = conn_rand_off;
     template.zipf_skew = 0.25; // default to a relatively gentle curve.
     template.pipelines = 1;
@@ -1159,7 +1270,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     template.iov_count = 1;
     if (strcmp(sender, "ascii_get") == 0) {
         template.writer = ascii_write_to_client;
-        template.ascii_format = ascii_get_format;
+        template.ascii_format = ascii_single_format;
         sprintf(template.s->key_prefix, "get %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_set") == 0) {
         template.writer = ascii_write_to_client;
@@ -1173,15 +1284,15 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
         sprintf(template.s->key_prefix, "%s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_incr") == 0) {
         template.writer = ascii_write_to_client;
-        template.ascii_format = ascii_incr_format;
+        template.ascii_format = ascii_incrdecr_format;
         sprintf(template.s->key_prefix, "incr %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_delete") == 0) {
         template.writer = ascii_write_to_client;
-        template.ascii_format = ascii_delete_format;
+        template.ascii_format = ascii_single_format;
         sprintf(template.s->key_prefix, "delete %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_decr") == 0) {
         template.writer = ascii_write_to_client;
-        template.ascii_format = ascii_decr_format;
+        template.ascii_format = ascii_incrdecr_format;
         sprintf(template.s->key_prefix, "decr %s", key_prefix_tmp);
     } else if (strcmp(sender, "bin_get") == 0) {
         template.writer = bin_write_to_client;
@@ -1221,6 +1332,18 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     } else {
         fprintf(stderr, "Unknown command writer: %s\n", sender);
         exit(1);
+    }
+
+    if (template.key_prealloc == 0) {
+        if (template.writer == ascii_write_mget_to_client) {
+            template.writer = ascii_write_flat_mget_to_client;
+        } else if (template.writer == ascii_write_to_client) {
+            template.writer = ascii_write_flat_to_client;
+        } else if (template.writer == bin_write_to_client) {
+            template.writer = bin_write_flat_to_client;
+        } else {
+            fprintf(stderr, "not adjusting writer prep function\n");
+        }
     }
 
     template.s->key_prefix_len = strlen(template.s->key_prefix);

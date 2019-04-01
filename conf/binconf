@@ -1,1 +1,1 @@
-send=bin_setq,recv=blind_read,conns=100,key_prefix=foobar,key_prealloc=0
+send=bin_setq,recv=blind_read,conns=100,key_prefix=foobar,key_prealloc=0,value_size=24
