@@ -40,7 +40,10 @@
 #include <stddef.h>
 #include <sys/stat.h>
 #include <signal.h>
-
+#ifdef USE_TLS
+#include <openssl/ssl.h>
+#include <poll.h>
+#endif
 // for pow() for zipf calculations.
 #include <math.h>
 
@@ -57,6 +60,9 @@ char host_default[NI_MAXHOST] = "127.0.0.1";
 char port_num_default[NI_MAXSERV] = "11211";
 char sock_path_default[SOCK_MAX];
 int alarm_fired = 0;
+#ifdef USE_TLS
+SSL_CTX *global_ctx;
+#endif
 
 enum conn_states {
     conn_connecting = 0,
@@ -109,6 +115,9 @@ struct connection {
     enum conn_states state;
     enum conn_states next_state;
     short ev_flags;
+#ifdef USE_TLS
+    SSL *ssl;
+#endif
 
     /* Counters, bits, flags for individual senders/getters. */
     int mget_count;                /* # of ascii mget keys to send at once */
@@ -276,7 +285,11 @@ static inline int sum_iovecs(const struct iovec *vecs, const int iov_count) {
 
 static void write_flat(struct connection *c, enum conn_states next_state) {
     int written = 0;
+#ifdef USE_TLS
+    written = SSL_write(c->ssl, c->wbuf + c->wbuf_written, c->wbuf_towrite);
+#else
     written = write(c->fd, c->wbuf + c->wbuf_written, c->wbuf_towrite);
+#endif
     if (written == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
@@ -658,7 +671,11 @@ static void read_from_client(void *arg) {
     struct connection *c = arg;
     int rbytes = 0;
     for (;;) {
-        rbytes = read(c->fd, c->t->shared_rbuf, 1024 * 32);
+#ifdef USE_TLS
+        rbytes = SSL_read(c->ssl, c->t->shared_rbuf, SHARED_RBUF_SIZE);
+#else
+        rbytes = read(c->fd, c->t->shared_rbuf, SHARED_RBUF_SIZE);
+#endif
         if (rbytes == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -742,6 +759,25 @@ static void client_handler(const int fd, const short which, void *arg) {
         break;
     }
 }
+
+/* === TLS code === */
+
+#ifdef USE_TLS
+// Can add/ignore flags/settings explicitly here.
+static int ssl_init(void) {
+    OPENSSL_init_ssl(0, NULL);
+
+    global_ctx = SSL_CTX_new(TLS_client_method());
+    if (global_ctx == NULL) {
+        fprintf(stderr, "failed to initialize OpenSSL\n");
+        exit(1);
+    }
+    int flags = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
+                SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1;
+    SSL_CTX_set_options(global_ctx, flags);
+    fprintf(stderr, "Initialized OpenSSL\n");
+}
+#endif
 
 #define U_PER_S 1000000
 static void timeval_split(const uint64_t in, long int *outs, long int *outu) {
@@ -852,6 +888,35 @@ static int new_connection(struct connection *t, char *sock_path)
     c->fd = sock;
     c->state = conn_connecting;
     c->ev_flags = EV_WRITE;
+#ifdef USE_TLS
+    c->ssl = SSL_new(global_ctx);
+    SSL_set_fd(c->ssl, sock);
+    // we want the benchmark to generally start all at once. I don't want to
+    // spread the handshake stuff through the code either.
+    for (;;) {
+        struct pollfd p = { .fd = sock };
+        int ret = SSL_connect(c->ssl);
+        if (ret == 1) {
+            break;
+        }
+        switch (SSL_get_error(c->ssl, ret)) {
+            case SSL_ERROR_WANT_READ:
+                p.events = POLLIN;
+                break;
+            case SSL_ERROR_WANT_WRITE:
+                p.events = POLLOUT;
+                break;
+            default:
+                perror("Unhandled OpenSSL error while connecting");
+                exit(1);
+        }
+        poll(&p, 1, 5000 * 1000);
+        if ((p.revents & (POLLIN|POLLOUT)) == 0) {
+            fprintf(stderr, "Socket hangup while waiting for SSL connection\n");
+            exit(1);
+        }
+    }
+#endif
 
     if (c->usleep) {
         // spread out the initial wakeup times
@@ -1460,6 +1525,9 @@ int main(int argc, char **argv)
     mc_thread *main_thread = NULL;
     main_thread = calloc(1, sizeof(mc_thread));
     setup_thread(main_thread);
+#ifdef USE_TLS
+    ssl_init();
+#endif
 
     const struct option longopts[] = {
         // standard operational options
