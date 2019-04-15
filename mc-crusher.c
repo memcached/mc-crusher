@@ -663,6 +663,7 @@ static void ascii_write_flat_to_client(void *arg) {
         c->wbuf_pos[1] = '\n';
         c->wbuf_pos += 2;
     }
+    run_counter(c);
 }
 
 /* === READERS === */
