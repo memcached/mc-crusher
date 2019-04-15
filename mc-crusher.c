@@ -667,6 +667,14 @@ static void ascii_write_flat_to_client(void *arg) {
 }
 
 /* === READERS === */
+// Seems like leaving some data in SSL_read causes wobbles in performance.
+// SSL_read() returns after each individual TLS frame read, not with a full read
+// buffer.
+#ifdef USE_TLS
+#define READ_MIN 1
+#else
+#define READ_MIN 2096
+#endif
 
 static void read_from_client(void *arg) {
     struct connection *c = arg;
@@ -684,7 +692,7 @@ static void read_from_client(void *arg) {
                 perror("Read error from client");
             }
         }
-        if (rbytes < 2096)
+        if (rbytes < READ_MIN)
             break; /* don't call read() again unless we may get data */
     }
 }
