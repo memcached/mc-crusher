@@ -143,6 +143,8 @@ sub start_crush {
 
     if ($child) {
         print "$bin --conf $cfile --ip $ip --port $port\n";
+        # TODO: option
+        #print "$bin --conf $cfile --sock /tmp/memcached.sock\n";
         $self->{crush_pid} = $child;
         # try to open output file in loop
         # watch for "done initializing\n"
@@ -167,6 +169,8 @@ sub start_crush {
         open(STDOUT, ">", $cout) or die "STDOUT -> $cout: $!";
         open(STDERR, ">&STDOUT", ) or die "STDERR -> STDOUT: $!";
         exec "$bin --conf $cfile --ip $ip --port $port";
+        # TODO: option
+        #exec "$bin --conf $cfile --sock /tmp/memcached.sock";
     }
 }
 
@@ -182,6 +186,21 @@ sub crush_config {
     my $self = shift;
     my $config = shift;
     $self->{crush_config} = $config;
+}
+
+sub make_crush_config {
+    my $self = shift;
+    my $ca = shift;
+    my @lines = ();
+    for my $c (@$ca) {
+        my $l = '';
+        for my $k (keys %$c) {
+            $l .= $k . '=' . $c->{$k} . ',';
+        }
+        chop $l;
+        push(@lines, $l);
+    }
+    $self->{crush_config} = join("\n", @lines);
 }
 
 # FIXME: Just keep an array
