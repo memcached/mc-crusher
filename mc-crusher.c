@@ -95,7 +95,9 @@ typedef struct _mc_thread {
 // TODO: Move more of the static values in here. counts/etc.
 typedef struct _mc_tshared {
     size_t key_prefix_len;
+    size_t cmd_postfix_len;
     unsigned char key_prefix[250];
+    unsigned char cmd_postfix[1024];
     unsigned char value[2048];     /* manually specified seed value */
 } mc_tshared;
 
@@ -618,6 +620,23 @@ static int ascii_single_format(struct connection *c) {
     *(p+1) = '\r';
     *(p+2) = '\n';
     return (p - (char *)c->wbuf_pos) + 3;
+}
+
+// meta commands: cmd key flags tokens
+static int ascii_metacmd_format(struct connection *c) {
+    char *p = c->wbuf_pos;
+    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    // now the flags/tokens
+    if (c->s->cmd_postfix_len) {
+        *p = ' ';
+        p++;
+        memcpy(p, c->s->cmd_postfix, c->s->cmd_postfix_len);
+        p += c->s->cmd_postfix_len;
+    }
+    *(p) = '\r';
+    *(p+1) = '\n';
+    return (p - (char *)c->wbuf_pos) + 2;
 }
 
 static void ascii_write_to_client(void *arg) {
@@ -1151,6 +1170,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     int add_space = 0;
     int new_thread = 0;
     char key_prefix_tmp[270];
+    char cmd_postfix_tmp[1024];
     char key_file[1024];
 
     enum {
@@ -1163,6 +1183,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
         EXPIRE,
         FLAGS,
         KEY_PREFIX,
+        CMD_POSTFIX,
         KEY_LEN,
         KEY_GENERATE,
         VALUE_SIZE,
@@ -1195,6 +1216,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
         [EXPIRE]           = "expire",
         [FLAGS]            = "flags",
         [KEY_PREFIX]       = "key_prefix",
+        [CMD_POSTFIX]      = "cmd_postfix",
         [KEY_LEN]          = "key_len",
         [KEY_GENERATE]     = "key_generate",
         [VALUE_SIZE]       = "value_size",
@@ -1222,6 +1244,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     memset(&template, 0, sizeof(struct connection));
     /* Set defaults into template */
     strcpy(key_prefix_tmp, "foo");
+    cmd_postfix_tmp[0] = 0;
     template.t = main_thread;
     template.mget_count = 2;
     template.value_size = 0;
@@ -1284,6 +1307,9 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
             break;
         case KEY_PREFIX:
             strcpy(key_prefix_tmp, value);
+            break;
+        case CMD_POSTFIX:
+            strcpy(cmd_postfix_tmp, value);
             break;
         case MGET_COUNT:
             template.mget_count = atoi(value);
@@ -1368,6 +1394,11 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
         template.writer = ascii_write_to_client;
         template.ascii_format = ascii_incrdecr_format;
         sprintf(template.s->key_prefix, "decr %s", key_prefix_tmp);
+    } else if (strcmp(sender, "ascii_mg") == 0) {
+        template.writer = ascii_write_to_client;
+        template.ascii_format = ascii_metacmd_format;
+        sprintf(template.s->key_prefix, "mg %s", key_prefix_tmp);
+        sprintf(template.s->cmd_postfix, "%s", cmd_postfix_tmp);
     } else if (strcmp(sender, "bin_get") == 0) {
         template.writer = bin_write_to_client;
         template.bin_prep_cmd = bin_prep_get;
@@ -1421,6 +1452,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     }
 
     template.s->key_prefix_len = strlen(template.s->key_prefix);
+    template.s->cmd_postfix_len = strlen(template.s->cmd_postfix);
 
     if (template.key_prealloc) {
         bool have_keys = false;
