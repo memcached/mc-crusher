@@ -99,11 +99,13 @@ sub warm {
     my $f = $a{flags} || 0;
     my $t = $a{start} || 1;
     my $c = $a{count};
+    my $cb = $a{callback} || 0;
     my $data = 'x' x $s;
 
     for ($t .. $c) {
         print $sock "set $p${_} $f $e $s noreply\r\n", $data, "\r\n";
         print "warm: $_\n" if ($_ % int($c / 10) == 0);
+        $cb->($_) if ($cb);
     }
 }
 
