@@ -153,11 +153,6 @@ struct connection {
     /* time pacing */
     struct timeval next_sleep;
     struct timeval tosleep;
-    /* iovectors */
-    struct iovec *vecs;
-    int    iov_used; /* iovecs used so far */
-    int    iov_count; /* iovecs in total */
-    int    iov_towrite; /* bytes to write */
 
     /* reader/writer function pointers */
     void (*writer)(void *arg);
@@ -221,68 +216,6 @@ static int update_conn_event_sleep(struct connection *c)
     evtimer_add(&c->ev, &t);
 
     return 1;
-}
-
-/* TODO: Be more wary of IOV_MAX */
-static void drain_iovecs(struct iovec *vecs, const int iov_count, const int written) {
-    int i;
-    int todrain = written;
-    for (i = 0; i < iov_count; i++) {
-        if (vecs[i].iov_len > 0) {
-            if (todrain >= vecs[i].iov_len) {
-                todrain -= vecs[i].iov_len;
-                vecs[i].iov_base = NULL;
-                vecs[i].iov_len  = 0;
-            } else {
-                vecs[i].iov_len -= todrain;
-                vecs[i].iov_base += todrain;
-                break;
-            }
-        }
-    }
-}
-
-static void write_iovecs(struct connection *c, enum conn_states next_state) {
-    int written = 0;
-    written = writev(c->fd, c->vecs, c->iov_count);
-    if (written == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
-            // the sender always checks for reads. not necessary to change?
-            c->state = conn_sending;
-            return;
-        } else {
-            perror("Write error to client");
-            exit(1);
-            return;
-        }
-    }
-
-    c->iov_towrite -= written;
-    if (c->iov_towrite > 0) {
-        update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
-        //fprintf(stderr, "Draining iovecs to %d (%d)\n", c->iov_towrite, written);
-        drain_iovecs(c->vecs, c->iov_count, written);
-        c->state = conn_sending;
-    } else {
-        c->state = next_state;
-        if (c->state == conn_reading) {
-            update_conn_event(c, EV_READ | EV_PERSIST);
-        } else if (c->state == conn_sending) {
-            update_conn_event(c, EV_READ | EV_WRITE | EV_PERSIST);
-        } else if (c->state == conn_sleeping) {
-            update_conn_event_sleep(c);
-        }
-    }
-}
-
-static inline int sum_iovecs(const struct iovec *vecs, const int iov_count) {
-    int i;
-    int sum = 0;
-    for (i = 0; i < iov_count; i++) {
-        sum += vecs[i].iov_len;
-    }
-    return sum;
 }
 
 static void write_flat(struct connection *c, enum conn_states next_state) {
@@ -383,22 +316,20 @@ static int bin_key_format(struct connection *c) {
     return (p - (char *)c->wbuf_pos);
 }
 
+static int bin_key_format_prealloc(struct connection *c) {
+    char *p = c->wbuf_pos;
+    struct mc_key *k = &c->keys[*c->cur_key];
+    memcpy(p, &c->key_blob[k->key_offset], k->key_len);
+    return k->key_len;
+}
+
 // can generalize this a bit further.
 static int bin_prep_getq(struct connection *c) {
     protocol_binary_request_get *pkt = (protocol_binary_request_get *)c->wbuf_pos;
     pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_GETQ;
 
     int l = sizeof(protocol_binary_request_get);
-    if (c->key_prealloc) {
-        struct iovec *vecs = c->vecs;
-        int i = c->iov_used;
-        vecs[i].iov_base = c->wbuf_pos;
-        vecs[i].iov_len  = l;
-        c->wbuf_pos += vecs[i].iov_len;
-        c->iov_used++;
-    } else {
-        c->wbuf_pos += l;
-    }
+    c->wbuf_pos += l;
     return l;
 }
 
@@ -407,16 +338,7 @@ static int bin_prep_get(struct connection *c) {
     pkt->message.header.request.opcode = PROTOCOL_BINARY_CMD_GET;
 
     int l = sizeof(protocol_binary_request_get);
-    if (c->key_prealloc) {
-        struct iovec *vecs = c->vecs;
-        int i = c->iov_used;
-        vecs[i].iov_base = c->wbuf_pos;
-        vecs[i].iov_len  = l;
-        c->wbuf_pos += vecs[i].iov_len;
-        c->iov_used++;
-    } else {
-        c->wbuf_pos += l;
-    }
+    c->wbuf_pos += l;
     return l;
 }
 
@@ -428,16 +350,7 @@ static int bin_prep_set(struct connection *c) {
     pkt->message.body.expiration = htonl(c->expire);
 
     int l = sizeof(protocol_binary_request_header) + 8;
-    if (c->key_prealloc) {
-        struct iovec *vecs = c->vecs;
-        int i = c->iov_used;
-        vecs[i].iov_base = c->wbuf_pos;
-        vecs[i].iov_len  = l;
-        c->wbuf_pos += vecs[i].iov_len;
-        c->iov_used++;
-    } else {
-        c->wbuf_pos += l;
-    }
+    c->wbuf_pos += l;
     return l;
 }
 
@@ -460,53 +373,8 @@ static int bin_prep_touch(struct connection *c) {
     pkt->message.body.expiration = htonl(c->expire);
 
     int l = sizeof(protocol_binary_request_header) + 4;
-    if (c->key_prealloc) {
-        struct iovec *vecs = c->vecs;
-        int i = c->iov_used;
-        vecs[i].iov_base = c->wbuf_pos;
-        vecs[i].iov_len  = l;
-        c->wbuf_pos += vecs[i].iov_len;
-        c->iov_used++;
-    } else {
-        c->wbuf_pos += l;
-    }
+    c->wbuf_pos += l;
     return l;
-}
-
-/* Unhappy with this, but it's still shorter/better than the old code.
- * Binprot is just unwieldy in C, or I haven't figured out how to use it
- * simply yet.
- */
-static void bin_write_to_client(void *arg) {
-    struct connection *c = arg;
-    struct iovec *vecs = c->vecs;
-    protocol_binary_request_header *pkt = (protocol_binary_request_header *)c->wbuf_pos;
-    memset(pkt, 0, sizeof(protocol_binary_request_header));
-    pkt->request.magic = PROTOCOL_BINARY_REQ;
-    c->bin_prep_cmd(c);
-    if (c->key_prealloc) {
-        vecs[c->iov_used].iov_base = &c->key_blob[c->keys[*c->cur_key].key_offset];
-        vecs[c->iov_used].iov_len  = c->keys[*c->cur_key].key_len;
-    } else {
-        vecs[c->iov_used].iov_base = c->wbuf_pos;
-        vecs[c->iov_used].iov_len = c->bin_format(c);
-        c->wbuf_pos += vecs[c->iov_used].iov_len;
-    }
-    int bodylen = vecs[c->iov_used].iov_len + pkt->request.extlen;
-    pkt->request.keylen = htons(vecs[c->iov_used].iov_len);
-    c->iov_used++;
-    if (c->value_size) {
-        bodylen += c->value_size;
-        if (c->use_shared_value) {
-            vecs[c->iov_used].iov_base = c->t->shared_value;
-        } else {
-            vecs[c->iov_used].iov_base = c->s->value;
-        }
-        vecs[c->iov_used].iov_len = c->value_size;
-        c->iov_used++;
-    }
-    pkt->request.bodylen = htonl(bodylen);
-    run_counter(c);
 }
 
 static void bin_write_flat_to_client(void *arg) {
@@ -538,35 +406,13 @@ static void bin_write_flat_to_client(void *arg) {
 
 /* === ASCII PROTOCOL TESTS === */
 
+// TODO: key prealloc
 static int ascii_mget_format(struct connection *c) {
     char *p = c->wbuf_pos;
     memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
     p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
     *p = ' ';
     return (p - (char *)c->wbuf_pos) + 1;
-}
-
-/* Multigets have a weird/specific format. */
-static void ascii_write_mget_to_client(void *arg) {
-    struct connection *c = arg;
-    int i;
-    struct iovec *vecs = c->vecs;
-    vecs[0].iov_base = "get ";
-    vecs[0].iov_len  = 4;
-    for (i = 1; i < c->mget_count + 1; i++) {
-        if (c->key_prealloc) {
-            vecs[i].iov_base = &c->key_blob[c->keys[*c->cur_key].key_offset];
-            vecs[i].iov_len  = c->keys[*c->cur_key].key_len;
-        } else {
-            vecs[i].iov_base = c->wbuf_pos;
-            vecs[i].iov_len  = ascii_mget_format(c);
-            c->wbuf_pos += vecs[i].iov_len;
-        }
-        run_counter(c);
-    }
-    vecs[i].iov_base = "\r\n";
-    vecs[i].iov_len  = 2;
-    c->iov_used = i;
 }
 
 static void ascii_write_flat_mget_to_client(void *arg) {
@@ -639,33 +485,6 @@ static int ascii_metacmd_format(struct connection *c) {
     return (p - (char *)c->wbuf_pos) + 2;
 }
 
-static void ascii_write_to_client(void *arg) {
-    struct connection *c = arg;
-    struct iovec *vecs = c->vecs;
-    if (c->key_prealloc) {
-        vecs[c->iov_used].iov_base = &c->key_blob[c->keys[*c->cur_key].key_offset];
-        vecs[c->iov_used].iov_len  = c->keys[*c->cur_key].key_len;
-    } else {
-        vecs[c->iov_used].iov_base = c->wbuf_pos;
-        vecs[c->iov_used].iov_len = c->ascii_format(c);
-        c->wbuf_pos += vecs[c->iov_used].iov_len;
-    }
-    c->iov_used++;
-    if (c->value_size) {
-        if (c->use_shared_value) {
-            vecs[c->iov_used].iov_base = c->t->shared_value;
-        } else {
-            vecs[c->iov_used].iov_base = c->s->value;
-        }
-        vecs[c->iov_used].iov_len = c->value_size;
-        c->iov_used++;
-        vecs[c->iov_used].iov_base = "\r\n";
-        vecs[c->iov_used].iov_len = 2;
-        c->iov_used++;
-    }
-    run_counter(c);
-}
-
 // for fast-writing to wbuf
 // WARNING: sets can easily blow this up :(
 static void ascii_write_flat_to_client(void *arg) {
@@ -728,14 +547,10 @@ static void sleep_handler(const int fd, const short which, void *arg) {
 static inline void run_write(struct connection *c) {
     int i;
     c->wbuf_pos = c->wbuf;
-    c->iov_used = 0;
     for (i = 0; i < c->pipelines; i++) {
         c->writer(c);
     }
-    if (c->iov_used) {
-        c->iov_towrite = sum_iovecs(c->vecs, c->iov_used);
-        write_iovecs(c, c->next_state);
-    } else {
+    {
         // not using iovecs, save some libc/kernel looping.
         c->wbuf_towrite = c->wbuf_pos - (unsigned char *)&c->wbuf;
         c->wbuf_written = 0;
@@ -768,13 +583,11 @@ static void client_handler(const int fd, const short which, void *arg) {
             c->reader(c);
         }
         if (which & EV_WRITE) {
-            if (c->iov_towrite > 0) {
-                write_iovecs(c, c->next_state);
-            } else if (c->wbuf_towrite) {
+            if (c->wbuf_towrite) {
                 write_flat(c, c->next_state);
             }
 
-            if (c->iov_towrite <= 0 && c->wbuf_towrite == 0) {
+            if (c->wbuf_towrite == 0) {
                 run_write(c);
             }
         }
@@ -782,7 +595,7 @@ static void client_handler(const int fd, const short which, void *arg) {
     case conn_reading:
         c->reader(c);
         c->state = conn_sending;
-        if (c->iov_towrite <= 0 && c->wbuf_towrite <= 0)
+        if (c->wbuf_towrite <= 0)
             run_write(c);
         break;
     }
@@ -962,16 +775,10 @@ static int new_connection(struct connection *t, char *sock_path)
         event_add(&c->ev, NULL);
     }
 
-    if (c->iov_count > 0) {
-        c->vecs = calloc(c->iov_count, sizeof(struct iovec));
-        if (c->vecs == NULL) {
-            fprintf(stderr, "Couldn't allocate iovecs\n");
-            exit(1);
-        }
-    }
-
     return sock;
 }
+
+/* Pregenerated key handling */
 
 // TODO: use a header line or meta file to determine when the file's changed.
 static bool load_keys(struct connection *t, const char *file) {
@@ -1367,88 +1174,68 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
         }
     }
 
-    template.iov_count = 1;
     if (strcmp(sender, "ascii_get") == 0) {
-        template.writer = ascii_write_to_client;
+        template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_single_format;
         sprintf(template.s->key_prefix, "get %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_set") == 0) {
-        template.writer = ascii_write_to_client;
+        template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_set_format;
-        template.iov_count = 3;
         sprintf(template.s->key_prefix, "set %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_mget") == 0) {
-        template.writer = ascii_write_mget_to_client;
-        template.iov_count = template.mget_count + 2;
+        template.writer = ascii_write_flat_mget_to_client;
         template.prealloc_format = ascii_mget_format;
         sprintf(template.s->key_prefix, "%s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_incr") == 0) {
-        template.writer = ascii_write_to_client;
+        template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_incrdecr_format;
         sprintf(template.s->key_prefix, "incr %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_delete") == 0) {
-        template.writer = ascii_write_to_client;
+        template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_single_format;
         sprintf(template.s->key_prefix, "delete %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_decr") == 0) {
-        template.writer = ascii_write_to_client;
+        template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_incrdecr_format;
         sprintf(template.s->key_prefix, "decr %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_mg") == 0) {
-        template.writer = ascii_write_to_client;
+        template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_metacmd_format;
         sprintf(template.s->key_prefix, "mg %s", key_prefix_tmp);
         sprintf(template.s->cmd_postfix, "%s", cmd_postfix_tmp);
     } else if (strcmp(sender, "bin_get") == 0) {
-        template.writer = bin_write_to_client;
+        template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_get;
         template.bin_format = bin_key_format;
-        template.prealloc_format = bin_key_format;
-        template.iov_count = 2;
+        template.prealloc_format = bin_key_format_prealloc;
         strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_getq") == 0) {
-        template.writer = bin_write_to_client;
+        template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_getq;
         template.bin_format = bin_key_format;
-        template.prealloc_format = bin_key_format;
-        template.iov_count = 2;
+        template.prealloc_format = bin_key_format_prealloc;
         strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_set") == 0) {
-        template.writer = bin_write_to_client;
+        template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_set;
         template.bin_format = bin_key_format;
-        template.prealloc_format = bin_key_format;
-        template.iov_count = 3;
+        template.prealloc_format = bin_key_format_prealloc;
         strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_setq") == 0) {
-        template.writer = bin_write_to_client;
+        template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_setq;
         template.bin_format = bin_key_format;
-        template.prealloc_format = bin_key_format;
-        template.iov_count = 3;
+        template.prealloc_format = bin_key_format_prealloc;
         strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_touch") == 0) {
-        template.writer = bin_write_to_client;
+        template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_touch;
         template.bin_format = bin_key_format;
-        template.prealloc_format = bin_key_format;
-        template.iov_count = 2;
+        template.prealloc_format = bin_key_format_prealloc;
         strcpy(template.s->key_prefix, key_prefix_tmp);
     } else {
         fprintf(stderr, "Unknown command writer: %s\n", sender);
         exit(1);
-    }
-
-    if (template.key_prealloc == 0) {
-        if (template.writer == ascii_write_mget_to_client) {
-            template.writer = ascii_write_flat_mget_to_client;
-        } else if (template.writer == ascii_write_to_client) {
-            template.writer = ascii_write_flat_to_client;
-        } else if (template.writer == bin_write_to_client) {
-            template.writer = bin_write_flat_to_client;
-        } else {
-            fprintf(stderr, "not adjusting writer prep function\n");
-        }
     }
 
     template.s->key_prefix_len = strlen(template.s->key_prefix);
@@ -1472,8 +1259,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
             write_keys(&template, key_file);
         }
     }
-    // FIXME: Should use iov_count for prealloc, iov_used for writers.
-    template.iov_count = template.iov_count * template.pipelines;
 
     // don't actually do anything if we're just here to pre-generate keys
     if (keygen) {
