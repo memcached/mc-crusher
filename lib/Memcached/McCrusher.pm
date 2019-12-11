@@ -97,7 +97,7 @@ sub warm {
     my $p = $a{prefix};
     my $e = $a{exptime} || 0;
     my $f = $a{flags} || 0;
-    my $t = $a{start} || 1;
+    my $t = $a{start} || 0;
     my $c = $a{count};
     my $cb = $a{callback} || 0;
     my $data = 'x' x $s;
