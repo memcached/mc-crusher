@@ -77,11 +77,6 @@ enum conn_rand {
     conn_rand_zipf,
 };
 
-struct mc_key {
-    uint64_t key_offset;
-    size_t key_len;
-};
-
 typedef struct _mc_thread {
     pthread_t thread_id;
     struct event_base *base;
@@ -134,14 +129,10 @@ struct connection {
     int usleep; /* us to sleep between write runs */
     uint64_t stop_after; /* run this many write events then stop */
     /* Buffers */
-    uint64_t key_blob_size;
     uint64_t key_randomize;
     uint64_t *cur_key;
     uint64_t *write_count;
     uint32_t key_count;
-    int      key_prealloc;
-    struct mc_key *keys; // pointers into key_blob.
-    unsigned char *key_blob;
     unsigned char *wbuf_pos;
 
     /* random number handling */
@@ -162,7 +153,6 @@ struct connection {
     int (*ascii_format)(struct connection *c);
     int (*bin_format)(struct connection *c);
     int (*bin_prep_cmd)(struct connection *c);
-    int (*prealloc_format)(struct connection *c);
     unsigned char wbuf[65536]; // putting this at the end to get more of the above into fewer cachelines.
 };
 
@@ -316,13 +306,6 @@ static int bin_key_format(struct connection *c) {
     return (p - (char *)c->wbuf_pos);
 }
 
-static int bin_key_format_prealloc(struct connection *c) {
-    char *p = c->wbuf_pos;
-    struct mc_key *k = &c->keys[*c->cur_key];
-    memcpy(p, &c->key_blob[k->key_offset], k->key_len);
-    return k->key_len;
-}
-
 // can generalize this a bit further.
 static int bin_prep_getq(struct connection *c) {
     protocol_binary_request_get *pkt = (protocol_binary_request_get *)c->wbuf_pos;
@@ -406,7 +389,6 @@ static void bin_write_flat_to_client(void *arg) {
 
 /* === ASCII PROTOCOL TESTS === */
 
-// TODO: key prealloc
 static int ascii_mget_format(struct connection *c) {
     char *p = c->wbuf_pos;
     memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
@@ -778,195 +760,8 @@ static int new_connection(struct connection *t, char *sock_path)
     return sock;
 }
 
-/* Pregenerated key handling */
-
-// TODO: use a header line or meta file to determine when the file's changed.
-static bool load_keys(struct connection *t, const char *file) {
-    size_t index_size = sizeof(struct mc_key) * t->key_count;
-    size_t key_blob_size = 0;
-    char ptmp[1030];
-    struct stat statbuf;
-
-    snprintf(ptmp, 1029, "%s.idx", file);
-    FILE *ki = fopen(ptmp, "r");
-    if (ki == NULL) {
-        perror("Failed to open key index file for reading\n");
-        return false;
-    }
-
-    t->keys = malloc(index_size);
-    if (t->keys == NULL) {
-        fprintf(stderr, "Failed to malloc space for key index\n");
-        exit(1);
-    }
-
-    fprintf(stdout, "Loading key index file of size: %lu\n", index_size);
-    {
-        size_t read = fread(t->keys, 1, index_size, ki);
-        if (read < index_size) {
-            fprintf(stderr, "Failed to read key index file\n");
-            exit(1);
-        }
-    }
-    fclose(ki);
-
-    // key blob file size is unknown, so we ask the filesystem.
-    snprintf(ptmp, 1029, "%s.keys", file);
-    if (stat(ptmp, &statbuf) != 0) {
-        perror("Failed to stat key blob file");
-        return false;
-    }
-
-    key_blob_size = statbuf.st_size;
-
-    FILE *kf = fopen(ptmp, "r");
-    if (kf == NULL) {
-        perror("Failed to open key blob file for reading");
-        exit(1);
-    }
-
-    t->key_blob_size = key_blob_size;
-    t->key_blob = malloc(key_blob_size);
-    if (t->key_blob == NULL) {
-        fprintf(stderr, "Failed to malloc space for key blob\n");
-        exit(1);
-    }
-
-    fprintf(stdout, "Loading key blob file of size: %lu\n", key_blob_size);
-    {
-        size_t read = fread(t->key_blob, 1, key_blob_size, kf);
-        if (read < key_blob_size) {
-            fprintf(stderr, "Failed to read key blob file\n");
-            exit(1);
-        }
-    }
-
-    fclose(kf);
-    return true;
-}
-
-// FIXME: could put it all in one file since key index size is known?
-static void write_keys(const struct connection *t, const char *file) {
-    size_t index_size = sizeof(struct mc_key) * t->key_count;
-    size_t key_blob_size = t->key_blob_size;
-    char ptmp[1030];
-
-    snprintf(ptmp, 1029, "%s.idx", file);
-    FILE *ki = fopen(ptmp, "w");
-    if (ki == NULL) {
-        perror("Failed to open key index file for writing");
-        exit(1);
-    }
-
-    {
-        size_t written = fwrite(t->keys, 1, index_size, ki);
-        if (written < index_size) {
-            // TODO: how to actually use ferror?
-            fprintf(stderr, "failed to write data to key index file\n");
-            exit(1);
-        }
-    }
-    fclose(ki);
-
-    snprintf(ptmp, 1029, "%s.keys", file);
-    FILE *kf = fopen(ptmp, "w");
-    if (kf == NULL) {
-        perror("Failed to open key blob file for writing");
-        exit(1);
-    }
-
-    {
-        size_t written = fwrite(t->key_blob, 1, key_blob_size, kf);
-        if (written < key_blob_size) {
-            // TODO: how to actually use ferror?
-            fprintf(stderr, "failed to write data to key blob file\n");
-            exit(1);
-        }
-    }
-    fclose(kf);
-}
-
-static void prealloc_keys(struct connection *t, const size_t key_blob_size) {
-    /* This "leaks" the blob on purpose. Also temporary hardcoded rough key
-     * length is used. 
-     */
-    unsigned char *key_blob;
-    unsigned char *key_blob_ptr;
-    struct mc_key *keys;
-    struct mc_key temp;
-    uint64_t i;
-    int x;
-    int len = 0;
-    uint64_t used = 0;
-    uint32_t rand_one;
-    uint32_t rand_two;
-    char *fmt;
-
-    /* Generate the blobs and key list */
-    if (key_blob_size != 0) {
-        key_blob = calloc(key_blob_size, sizeof(char));
-        t->key_blob_size = key_blob_size;
-    } else {
-        key_blob = calloc(t->key_count, 60);
-        t->key_blob_size = t->key_count * 60;
-    }
-    keys     = calloc(t->key_count, sizeof(struct mc_key));
-    if (key_blob == NULL || keys == NULL) {
-        perror("Mallocing key prealloc");
-        exit(1);
-    }
-    key_blob_ptr = key_blob;
-    fprintf(stdout, "Prealloc memory: %llu + %llu\n", (unsigned long long)(t->key_blob_size),
-        (unsigned long long)sizeof(struct mc_key) * (t->key_count));
-
-    // Make the formatter think it's writing into wbuf.
-    t->wbuf_pos = key_blob_ptr;
-    t->cur_key = (uint64_t *)malloc(sizeof(uint64_t));
-    *t->cur_key = 0;
-
-    for (i = 0; i < t->key_count; i++) {
-        len = t->prealloc_format(t);
-        keys[i].key_offset = used;
-        keys[i].key_len = len;
-        t->wbuf_pos    += len;
-        used += len;
-        *t->cur_key += 1;
-    }
-    free(t->cur_key);
-    t->wbuf_pos = t->wbuf;
-
-    t->keys = keys;
-    t->key_blob = key_blob;
-    t->key_blob_size = used;
-
-    fprintf(stdout, "key_blob used: %llu\n", (unsigned long long)used);
-
-    /* Cool, now shuffle the key list if we need to */
-    if (t->key_randomize == 0)
-        return;
-
-    /* TODO: Allow specifying the random seed */
-    pcg32_random_t rng;
-    pcg32_srandom_r(&rng, 42u, 54u);
-
-    /* Run through the list once and shuffle */
-    for (x = 0; x < 4; x++) {
-    for (i = 0; i < t->key_count; i++) {
-        rand_one = pcg32_boundedrand_r(&rng, t->key_count);
-        rand_two = pcg32_boundedrand_r(&rng, t->key_count);
-        temp = keys[rand_one];
-        keys[rand_one] = keys[rand_two];
-        keys[rand_two] = temp;
-    }
-    }
-    /* in case you want to peek at the shuffling :P
-    for (i = 0; i < t->key_count; i++) {
-        fprintf(stdout, "Key: %.*s\n", (int)keys[i].key_len, keys[i].key);
-    }*/
-}
-
 /* Get a little verbose to avoid a big if/else if tree */
-static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, bool use_sock) {
+static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock) {
     char *in_progress, *token;
     struct connection template;
     int conns_tomake = 1;
@@ -978,7 +773,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     int new_thread = 0;
     char key_prefix_tmp[270];
     char cmd_postfix_tmp[1024];
-    char key_file[1024];
 
     enum {
         SEND = 0,
@@ -1003,9 +797,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
         LIVE_RAND_ZIPF,
         STOP_AFTER,
         KEY_COUNT,
-        KEY_BLOB_SIZE,
-        KEY_PREALLOC,
-        KEY_FILE,
         HOST,
         PORT,
         THREAD,
@@ -1036,9 +827,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
         [LIVE_RAND_ZIPF]   = "live_rand_zipf",
         [STOP_AFTER]       = "stop_after",
         [KEY_COUNT]        = "key_count",
-        [KEY_BLOB_SIZE]    = "key_blob_size",
-        [KEY_PREALLOC]     = "key_prealloc",
-        [KEY_FILE]         = "key_file",
         [HOST]             = "host",
         [PORT]             = "port",
         [THREAD]           = "thread",
@@ -1059,9 +847,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     template.wbuf_written = 0;
     template.wbuf_towrite = 0;
     template.key_count = 200000;
-    template.key_blob_size = 0;
     template.key_randomize = 0;
-    template.key_prealloc = 0;
     template.rand = conn_rand_off;
     template.zipf_skew = 0.25; // default to a relatively gentle curve.
     template.pipelines = 1;
@@ -1069,7 +855,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
     template.flags = 0;
     strcpy(template.host, host_default);
     strcpy(template.port_num, port_num_default);
-    key_file[0] = 0;
     template.next_state = conn_reading;
     template.s = calloc(1, sizeof(mc_tshared));
     template.s->value[0] = '\0';
@@ -1144,15 +929,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
         case KEY_COUNT:
             template.key_count = atoi(value);
             break;
-        case KEY_BLOB_SIZE:
-            template.key_blob_size = atoi(value);
-            break;
-        case KEY_PREALLOC:
-            template.key_prealloc = atoi(value);
-            break;
-        case KEY_FILE:
-            strcpy(key_file, value);
-            break;
         case HOST:
             strcpy(template.host, value);
             break;
@@ -1184,7 +960,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
         sprintf(template.s->key_prefix, "set %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_mget") == 0) {
         template.writer = ascii_write_flat_mget_to_client;
-        template.prealloc_format = ascii_mget_format;
         sprintf(template.s->key_prefix, "%s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_incr") == 0) {
         template.writer = ascii_write_flat_to_client;
@@ -1207,31 +982,26 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
         template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_get;
         template.bin_format = bin_key_format;
-        template.prealloc_format = bin_key_format_prealloc;
         strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_getq") == 0) {
         template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_getq;
         template.bin_format = bin_key_format;
-        template.prealloc_format = bin_key_format_prealloc;
         strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_set") == 0) {
         template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_set;
         template.bin_format = bin_key_format;
-        template.prealloc_format = bin_key_format_prealloc;
         strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_setq") == 0) {
         template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_setq;
         template.bin_format = bin_key_format;
-        template.prealloc_format = bin_key_format_prealloc;
         strcpy(template.s->key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_touch") == 0) {
         template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_touch;
         template.bin_format = bin_key_format;
-        template.prealloc_format = bin_key_format_prealloc;
         strcpy(template.s->key_prefix, key_prefix_tmp);
     } else {
         fprintf(stderr, "Unknown command writer: %s\n", sender);
@@ -1240,30 +1010,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool keygen, b
 
     template.s->key_prefix_len = strlen(template.s->key_prefix);
     template.s->cmd_postfix_len = strlen(template.s->cmd_postfix);
-
-    if (template.key_prealloc) {
-        bool have_keys = false;
-        if (!template.prealloc_format) {
-            template.prealloc_format = template.ascii_format;
-        }
-        if (key_file[0] != 0) {
-            have_keys = load_keys(&template, key_file);
-        }
-
-        // FIXME: just fetch key_blob_size from the template?
-        if (!have_keys) {
-            prealloc_keys(&template, template.key_blob_size);
-        }
-
-        if (!have_keys && key_file[0] != 0) {
-            write_keys(&template, key_file);
-        }
-    }
-
-    // don't actually do anything if we're just here to pre-generate keys
-    if (keygen) {
-        return;
-    }
 
     if (new_thread != 0) {
         // spawn N threads with very similar configurations. allows sharing
@@ -1342,7 +1088,6 @@ int main(int argc, char **argv)
     FILE *cfd = NULL;
     char line[4096];
     int timeout = 0;
-    bool keygen = false; // exit after reading configuration.
     bool use_sock = false;
     double zipf_s = 0;
     int zipf_n = 0;
@@ -1363,8 +1108,6 @@ int main(int argc, char **argv)
         {"sock", required_argument, 0, 's'},
         {"conf", required_argument, 0, 'c'},
         {"timeout", required_argument, 0, 't'},
-        // keygen mode. exits after generating key files.
-        {"keygen", no_argument, 0, 'k'},
         // test mode for zipf distributions
         {"zipf-n", required_argument, 0, 'z'},
         {"zipf-s", required_argument, 0, 'x'},
@@ -1398,9 +1141,6 @@ int main(int argc, char **argv)
         case 't':
             timeout = atoi(optarg);
             break;
-        case 'k':
-            keygen = true;
-            break;
         case 'z':
             zipf_n = atoi(optarg);
             break;
@@ -1430,13 +1170,11 @@ int main(int argc, char **argv)
     }
 
     while (fgets(line, 4096, cfd) != NULL) {
-        parse_config_line(main_thread, line, keygen, use_sock);
+        parse_config_line(main_thread, line, use_sock);
     }
     fclose(cfd);
 
-    if (!keygen) {
-        create_thread(main_thread);
-    }
+    create_thread(main_thread);
 
     if (timeout != 0) {
         struct sigaction sig_h;
@@ -1450,9 +1188,7 @@ int main(int argc, char **argv)
     }
     // TODO: Fire a signal at parent when threads exit? since they shouldn't.
     printf("done initializing\n");
-    if (!keygen) {
-        pause();
-    }
+    pause();
     if (alarm_fired) {
         printf("timed run complete\n");
     }
