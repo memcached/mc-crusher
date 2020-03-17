@@ -9,7 +9,7 @@ my $addr = $ARGV[0];
 my $prefix = $ARGV[1];
 my $size = $ARGV[2];
 my $count = $ARGV[3];
-my $exptime = 0;
+my $exptime = 2;
 
 die "bench-warmer addr prefix size count" unless $addr && $prefix && $size && $count;
 

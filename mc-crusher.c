@@ -96,7 +96,7 @@ typedef struct _mc_thread {
 typedef struct _mc_tshared {
     size_t key_prefix_len;
     size_t cmd_postfix_len;
-    unsigned char key_prefix[250];
+    unsigned char key_prefix[284];
     unsigned char cmd_postfix[1024];
     unsigned char value[2048];     /* manually specified seed value */
 } mc_tshared;
@@ -784,10 +784,10 @@ static int new_connection(struct connection *t, char *sock_path)
 static bool load_keys(struct connection *t, const char *file) {
     size_t index_size = sizeof(struct mc_key) * t->key_count;
     size_t key_blob_size = 0;
-    char ptmp[1024];
+    char ptmp[1030];
     struct stat statbuf;
 
-    snprintf(ptmp, 1023, "%s.idx", file);
+    snprintf(ptmp, 1029, "%s.idx", file);
     FILE *ki = fopen(ptmp, "r");
     if (ki == NULL) {
         perror("Failed to open key index file for reading\n");
@@ -811,7 +811,7 @@ static bool load_keys(struct connection *t, const char *file) {
     fclose(ki);
 
     // key blob file size is unknown, so we ask the filesystem.
-    snprintf(ptmp, 1023, "%s.keys", file);
+    snprintf(ptmp, 1029, "%s.keys", file);
     if (stat(ptmp, &statbuf) != 0) {
         perror("Failed to stat key blob file");
         return false;
@@ -849,9 +849,9 @@ static bool load_keys(struct connection *t, const char *file) {
 static void write_keys(const struct connection *t, const char *file) {
     size_t index_size = sizeof(struct mc_key) * t->key_count;
     size_t key_blob_size = t->key_blob_size;
-    char ptmp[1024];
+    char ptmp[1030];
 
-    snprintf(ptmp, 1023, "%s.idx", file);
+    snprintf(ptmp, 1029, "%s.idx", file);
     FILE *ki = fopen(ptmp, "w");
     if (ki == NULL) {
         perror("Failed to open key index file for writing");
@@ -868,7 +868,7 @@ static void write_keys(const struct connection *t, const char *file) {
     }
     fclose(ki);
 
-    snprintf(ptmp, 1023, "%s.keys", file);
+    snprintf(ptmp, 1029, "%s.keys", file);
     FILE *kf = fopen(ptmp, "w");
     if (kf == NULL) {
         perror("Failed to open key blob file for writing");
