@@ -129,7 +129,6 @@ struct connection {
     int usleep; /* us to sleep between write runs */
     uint64_t stop_after; /* run this many write events then stop */
     /* Buffers */
-    uint64_t key_randomize;
     uint64_t *cur_key;
     uint64_t *write_count;
     uint32_t key_count;
@@ -792,7 +791,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         VALUE_RANGE_STEP,
         MGET_COUNT,
         VALUE,
-        RANDOMIZE,
         LIVE_RAND,
         LIVE_RAND_ZIPF,
         STOP_AFTER,
@@ -822,7 +820,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         [VALUE_RANGE_STEP] = "value_range_step",
         [MGET_COUNT]       = "mget_count",
         [VALUE]            = "value",
-        [RANDOMIZE]        = "key_randomize",
         [LIVE_RAND]        = "live_rand",
         [LIVE_RAND_ZIPF]   = "live_rand_zipf",
         [STOP_AFTER]       = "stop_after",
@@ -847,7 +844,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     template.wbuf_written = 0;
     template.wbuf_towrite = 0;
     template.key_count = 200000;
-    template.key_randomize = 0;
     template.rand = conn_rand_off;
     template.zipf_skew = 0.25; // default to a relatively gentle curve.
     template.pipelines = 1;
@@ -913,9 +909,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
             strcpy(template.s->value, value);
             template.value_size = strlen(value);
             template.use_shared_value = 0;
-            break;
-        case RANDOMIZE:
-            template.key_randomize = atoi(value);
             break;
         case LIVE_RAND:
             template.rand = conn_rand_uniform;
