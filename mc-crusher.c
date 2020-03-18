@@ -438,6 +438,17 @@ static int ascii_incrdecr_format(struct connection *c) {
     return (p - (char *)c->wbuf_pos) + 4;
 }
 
+static int ascii_touch_format(struct connection *c) {
+    char *p = c->wbuf_pos;
+    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    *p = ' ';
+    p = itoa_u32(c->expire, p+1);
+    *p = '\r';
+    *(p+1) = '\n';
+    return (p - (char *)c->wbuf_pos) + 2;
+}
+
 // get, delete, and so on.
 static int ascii_single_format(struct connection *c) {
     char *p = c->wbuf_pos;
@@ -966,6 +977,10 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_incrdecr_format;
         sprintf(template.s->key_prefix, "decr %s", key_prefix_tmp);
+    } else if (strcmp(sender, "ascii_touch") == 0) {
+        template.writer = ascii_write_flat_to_client;
+        template.ascii_format = ascii_touch_format;
+        sprintf(template.s->key_prefix, "touch %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_mg") == 0) {
         template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_metacmd_format;
