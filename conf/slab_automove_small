@@ -1,1 +1,1 @@
-send=ascii_set,recv=blind_read,conns=1,key_prefix=foosmall,value_size=300,key_prealloc=0,key_count=30000000
+send=ascii_set,recv=blind_read,conns=1,key_prefix=foosmall,value_size=300,key_count=30000000

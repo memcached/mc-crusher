@@ -98,8 +98,7 @@ host : define a host to connect to
 
 port : define a port to connect to
 
-key_count : number of keys to iterate across. use with key_prealloc=0 to
-iterate over large numbers of keys
+key_count : number of keys to iterate across.
 
 key_randomize : shuffle the keys rather than fetching in order
 
