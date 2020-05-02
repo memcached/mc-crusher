@@ -1,0 +1,345 @@
+#!/usr/bin/perl
+# NOTE: adjust $crush_dir, $out_dir, $server_args and so on to adjust for your
+# particular hardware.
+# This file is left as an example for running a series of tests with
+# mc-crusher using the perl library.
+# need to up nofile in /etc/security/limits.conf (65536)
+# Also need to update paths under get_bench()
+# ... and any configuration changes below get_bench()
+
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use Memcached::McCrusher;
+
+$|++;
+
+my $crush_dir = '/home/user/mc-crusher/';
+my $out_dir = '/home/user/output/';
+
+my $server_args;
+# NOTE: If you have a NUMA enabled system, it's good to pin memcached to a
+# single side, as you'll get more consistent results.
+# Can also pin the latency sampler to the same side, the benchmark to the
+# opposite side or different CPU's via taskset, etc.
+# reserving 0 (and its HT sibling 36) for latency tester.
+#my $numa_pfx = '/usr/bin/numactl --cpunodebind=0 --membind=0 --physcpubind=1-17,37-53 ';
+my $numa_pfx = '';
+
+sub get_bench {
+    my $sargs = shift;
+
+    # FIXME: only require mc-crusher directory?
+    my $bench = Memcached::McCrusher->new(
+        server_args => $sargs,
+        server_bin => '/usr/bin/numactl --cpunodebind=1 --membind=1 /home/user/memcached/memcached',
+        crush_bin => $numa_pfx . $crush_dir . 'mc-crusher',
+        balloon_bin => $numa_pfx . $crush_dir . 'balloon',
+        latency_bin => '/usr/bin/numactl --cpunodebind=0 --membind=0 --physcpubind=0 ' . $crush_dir . 'latency-sampler',
+        sample_bin => $crush_dir . 'bench-sample',
+        output_dir => $out_dir,
+    );
+
+    # 30 second tests.
+    $bench->sample_args(
+        runs => 15,
+        period => 2,
+        stats => ['cmd_get', 'cmd_set', 'get_hits', 'bytes_written', 'bytes_read', 'extstore_objects_written', 'get_extstore'],
+    );
+
+    return $bench;
+}
+
+my $server_threads = 36;
+my $key_count = 900_000_000;
+my $key_prefix = 'foobarbazqux';
+my $value_size = 256;
+
+sub get_mget_conf {
+    my $mget_conf = {
+        send => 'ascii_mget',
+        recv => 'blind_read',
+        conns => 1,
+        mget_count => 50,
+        key_prefix => $key_prefix,
+        key_prealloc => 0,
+        key_count => $key_count
+    };
+    return $mget_conf;
+}
+
+sub get_pipe_conf {
+    my $pipe_conf = {
+        send => 'ascii_get',
+        recv => 'blind_read',
+        conns => 1,
+        pipelines => 8,
+        key_prefix => $key_prefix,
+        key_prealloc => 0,
+        key_count => $key_count
+    };
+    return $pipe_conf;
+}
+
+sub get_paced_conf {
+    my $paced_conf = {
+        send => 'ascii_get',
+        recv => 'blind_read',
+        conns => 400,
+        pipelines => 50,
+        key_prefix => $key_prefix,
+        key_prealloc => 0,
+        usleep => 75000,
+        key_count => $key_count
+    };
+    return $paced_conf;
+}
+
+sub get_pacedsets_conf {
+    my $pacedsets_conf = {
+        send => 'ascii_set',
+        recv => 'blind_read',
+        conns => 200,
+        pipelines => 50,
+        key_prefix => $key_prefix,
+        usleep => 75000,
+        key_prealloc => 0,
+        value_size => $value_size,
+        key_count => $key_count
+    };
+    return $pacedsets_conf;
+}
+
+# Test configurations
+
+{
+    my $TEST_TYPE;
+    my $thr_max = 25; # 40
+    my $thr_step = 1; # 2
+    my $threads = 0;
+    my $base_paced_conns = 400;
+    my $extstore = 0;
+
+    my $test_set_main = sub {
+        my $out_base = $out_dir . "main_${TEST_TYPE}_keys_${key_count}";
+        my $finish_file = $out_base . '.finished';
+        if (-s $finish_file) {
+            print "skipping test set $out_base...\n";
+            return;
+        }
+
+        my $bench = get_bench($server_args);
+        my $sock = $bench->start_memcached();
+
+        print "memc started (main) $server_args\n";
+
+        # sudo cgcreate -g memory,cpu:memcached
+        # echo "95G" > /sys/fs/cgroup/memory/memcached/memory.limit_in_bytes
+        # limits process + cache memory without resorting to ballooning.
+        #if ($extstore) {
+        #    my $pid = $bench->{server_pid};
+        #    print `cgclassify -g memory:memcached $pid`;
+        #}
+
+        $bench->warm(
+            prefix => $key_prefix,
+            exptime => 0,
+            size => $value_size,
+            count => $key_count,
+            progress => 1,
+            callback => sub {
+                my $cnt = shift;
+                if ($cnt % 2000000 == 0) {
+                    sleep 1;
+                    # FIXME: need my own socket for stats call
+                }
+            },
+        );
+        $bench->latency_args(
+            prefix => $key_prefix,
+            key_max => $key_count,
+            random => 'unset',
+            pace_time => 5000,
+            dump_rate => 0
+        );
+
+        if ($extstore) {
+            wait_for_extstore_settle($bench);
+            wait_for_lru_settle($bench);
+        } else {
+            sleep 2;
+            wait_for_lru_settle($bench);
+        }
+
+        my $out;
+        for (my $count = 1; $count <= $thr_max; $count += $thr_step) {
+            my $c = get_mget_conf();
+            $c->{live_rand} = 1;
+            $c->{thread} = $count;
+            $out = $out_base . "_threads_${count}_mget_uniform";
+            $bench->make_crush_config([$c]);
+            run($bench, $out);
+            delete $c->{live_rand};
+            $c->{live_rand_zipf} = 1;
+            $c->{zipf_skew} = 0.90;
+            $out = $out_base . "_threads_${count}_mget_zipf";
+            $bench->make_crush_config([$c]);
+            run($bench, $out);
+        }
+
+        for (my $count = 1; $count <= $thr_max; $count += $thr_step) {
+            my $c = get_pipe_conf();
+            $c->{live_rand} = 1;
+            $c->{thread} = $count;
+            $out = $out_base . "_threads_${count}_pipe_uniform";
+            $bench->make_crush_config([$c]);
+            run($bench, $out);
+            delete $c->{live_rand};
+            $c->{live_rand_zipf} = 1;
+            $c->{zipf_skew} = 0.90;
+            $out = $out_base . "_threads_${count}_pipe_zipf";
+            $bench->make_crush_config([$c]);
+            run($bench, $out);
+        }
+
+        for (my $count = 1; $count <= $thr_max; $count += $thr_step) {
+            my $c = get_paced_conf();
+            $c->{conns} = $base_paced_conns;
+            $c->{live_rand} = 1;
+            $c->{thread} = $count;
+            $out = $out_base . "_threads_${count}_paced_uniform";
+            $bench->make_crush_config([$c]);
+            run($bench, $out);
+            delete $c->{live_rand};
+            $c->{live_rand_zipf} = 1;
+            $c->{zipf_skew} = 0.90;
+            $out = $out_base . "_threads_${count}_paced_zipf";
+            $bench->make_crush_config([$c]);
+            run($bench, $out);
+        }
+
+        for (my $count = 1; $count <= $thr_max; $count += $thr_step) {
+            for my $pace (99, 90) {
+                my $c = get_paced_conf();
+                my $c2 = get_pacedsets_conf();
+                $c->{live_rand} = 1;
+                $c2->{live_rand} = 1;
+                $c->{thread} = $count;
+                $c2->{thread} = $count;
+                $c->{conns} = int($base_paced_conns * ($pace / 100));
+                $c2->{conns} = $base_paced_conns - $c->{conns};
+                $out = $out_base . "_threads_${count}_paced${pace}_uniform";
+                $bench->make_crush_config([$c, $c2]);
+                run($bench, $out);
+                if ($extstore) {
+                    wait_for_extstore_settle($bench);
+                }
+                delete $c->{live_rand};
+                $c->{live_rand_zipf} = 1;
+                $c->{zipf_skew} = 0.90;
+                $c2->{live_rand_zipf} = 1;
+                $c2->{zipf_skew} = 0.90;
+                $out = $out_base . "_threads_${count}_paced${pace}_zipf";
+                $bench->make_crush_config([$c, $c2]);
+                run($bench, $out);
+                if ($extstore) {
+                    wait_for_extstore_settle($bench);
+                }
+            }
+        }
+
+        $bench->stop_memcached();
+
+        open(my $fh, "> $finish_file") or die "Couldn't open $finish_file for writing: $!";
+        print $fh "done.\n";
+        close($fh);
+    };
+
+    # Test routines:
+    # add one for each main configuration test on the local system.
+    # if you're only doing one set of tests, don't need to add more.
+    # (skipping RAM? pointless for my purposes)
+
+    # - extstore example
+    $extstore = 1;
+    $base_paced_conns = 25;
+    $TEST_TYPE = 'example';
+    my $RAM = '86000';
+    # NOTE: you can/should drastically simplify these options. This is an
+    # example:
+    # no_lru_crawler for performance consistency, etc.
+    $server_args = "-l 127.0.0.1 -t 36 -c 48000 -m $RAM -o no_lru_crawler -b 4096 -s /tmp/memcached.sock -o ext_wbuf_size=64,ext_threads=16,ext_item_size=240,ext_max_frag=0.80,hashpower=30,no_lru_crawler,ext_recache_rate=0,ext_item_age=5,ext_path=/mnt/device/mc/extstore:400G";
+    $test_set_main->();
+    sleep 30;
+
+    # RAM test without extstore!
+    $extstore = 0;
+    $TEST_TYPE = 'ram';
+    $server_args = '-l 127.0.0.1 -t 36 -c 48000 -m 600000 -o no_lru_crawler -b 4096 -s /tmp/memcached.sock';
+    $test_set_main->();
+}
+
+sub wait_for_lru_settle {
+    my $bench = shift;
+    my $last_count = -1;
+    print "lru maintainer thread settling";
+    while (1) {
+        my $s = $bench->stats();
+        # just in case, watch for hash_is_expanding.
+        last if ($last_count == $s->{moves_to_cold} && $s->{hash_is_expanding} == 0);
+        $last_count = $s->{moves_to_cold};
+        print ".";
+        sleep 1;
+    }
+    print "\n";
+}
+
+sub wait_for_extstore_settle {
+    my $bench = shift;
+    my $last_count = -1;
+    print "extstore flushing";
+    while (1) {
+        my $s = $bench->stats();
+        last if ($last_count == $s->{extstore_objects_written});
+        $last_count = $s->{extstore_objects_written};
+        print ".";
+        sleep 1;
+    }
+    print "\n";
+}
+
+sub run {
+    my $bench = shift;
+    my $out = shift;
+    my $overhead = shift || 5000;
+    mkdir($out);
+    my $ofile = $out . '/' . 'finished';
+    if (-s $ofile) {
+        print "skipping $out...\n";
+        return;
+    }
+
+    $bench->output_dir($out); 
+    $bench->start_crush();
+    print "crush started!\n";
+    $bench->sample_run();
+    print "sampling complete\n";
+    $bench->stop_crush();
+    my $stats = $bench->stats();
+    my $slabstats = $bench->stats('slabs');
+
+    open(my $fh, "> $ofile") or die "couldn't open $ofile for writing: $!";
+    for my $k (sort keys %$stats) {
+        print $fh "STATS $k ", $stats->{$k}, "\n";
+    }
+    for my $k (sort keys %$slabstats) {
+        print $fh "STATS $k ", $slabstats->{$k}, "\n";
+    }
+
+    close($fh);
+    print "stopped crush... finished $out\n";
+    sleep 5;
+}
+
+# automatically kills crusher/memcached
