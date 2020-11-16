@@ -1,1 +1,1 @@
-send=ascii_get,recv=blind_read,conns=10,key_prefix=foo,key_prealloc=1,key_count=4000
+send=ascii_get,recv=blind_read,conns=10,key_prefix=foo,key_count=4000

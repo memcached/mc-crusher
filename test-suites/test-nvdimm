@@ -74,7 +74,6 @@ $bench->sample_args(
         conns => $server_threads,
         mget_count => 50,
         key_prefix => $key_prefix,
-        key_prealloc => 0,
         #key_file => "$key_blob_path/mget",
         key_count => $key_count
     };
@@ -84,7 +83,6 @@ $bench->sample_args(
         conns => $server_threads,
         pipelines => 8,
         key_prefix => $key_prefix,
-        key_prealloc => 0,
         #key_file => "$key_blob_path/pipe",
         key_count => $key_count
     };
@@ -94,7 +92,6 @@ $bench->sample_args(
         conns => 400,
         pipelines => 50,
         key_prefix => $key_prefix,
-        key_prealloc => 0,
         #key_file => "$key_blob_path/paced",
         usleep => 75000,
         key_count => $key_count
@@ -106,7 +103,6 @@ $bench->sample_args(
         pipelines => 50,
         key_prefix => $key_prefix,
         usleep => 75000,
-        key_prealloc => 0,
         value_size => $value_size,
         key_count => $key_count
     };

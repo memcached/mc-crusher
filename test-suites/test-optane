@@ -48,13 +48,13 @@ $bench->latency_args(
     dump_rate => 0
 );
 
-my $conf = qq{send=ascii_mget,recv=blind_read,conns=50,mget_count=20,key_prefix=foo,key_prealloc=1,key_count=$key_count,key_randomize=1};
-my $pipe_conf = qq{send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=$key_count,key_prealloc=1,key_randomize=1
-send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=$key_count,thread=1,key_prealloc=1,key_randomize=1};
-my $mixed_conf = qq{send=ascii_mget,recv=blind_read,conns=50,mget_count=50,key_prefix=foo,key_prealloc=1,key_count=$key_count,key_randomize=1
-send=ascii_set,recv=blind_read,conns=20,key_prefix=zoobar,key_prealloc=0,pipelines=8,value_size=550,key_count=20000000,thread=1};
-my $paced_conf = qq{send=ascii_get,recv=blind_read,conns=1,key_prefix=foo,pipelines=50,key_prealloc=1,key_count=$key_count,key_randomize=1,usleep=50000
-send=ascii_get,recv=blind_read,conns=1,key_prefix=foo,pipelines=50,key_prealloc=1,key_count=$key_count,key_randomize=1,usleep=50000,thread=1};
+my $conf = qq{send=ascii_mget,recv=blind_read,conns=50,mget_count=20,key_prefix=foo,key_count=$key_count,key_randomize=1};
+my $pipe_conf = qq{send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=$key_count,key_randomize=1
+send=ascii_get,recv=blind_read,conns=50,key_prefix=foo,pipelines=8,key_count=$key_count,thread=1,key_randomize=1};
+my $mixed_conf = qq{send=ascii_mget,recv=blind_read,conns=50,mget_count=50,key_prefix=foo,key_count=$key_count,key_randomize=1
+send=ascii_set,recv=blind_read,conns=20,key_prefix=zoobar,pipelines=8,value_size=550,key_count=20000000,thread=1};
+my $paced_conf = qq{send=ascii_get,recv=blind_read,conns=1,key_prefix=foo,pipelines=50,key_count=$key_count,key_randomize=1,usleep=50000
+send=ascii_get,recv=blind_read,conns=1,key_prefix=foo,pipelines=50,key_count=$key_count,key_randomize=1,usleep=50000,thread=1};
 
 my @devices = ();
 for my $device ('ram', 'ssd', 'optane1', 'optane2', 'optane3') {
