@@ -6,7 +6,7 @@ Building
 --------
 
 $ (install libevent + headers)
-$ ./compile
+$ ./make
 
 Usage
 -----
