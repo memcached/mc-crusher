@@ -16,15 +16,17 @@ int main(int argc, char **argv) {
     int size = atoi(argv[1]);
     printf("megabytes: %d\n", size);
 
-    for (int x = 0; x < size; x++) {
+    int x;
+    for (x = 0; x < size; x++) {
         // We're going to leak this.
         uint64_t *temp = calloc(1, 1024 * 1024);
         if (temp == NULL) {
             fprintf(stderr, "Failed to calloc chunk #%d\n", x);
             exit(1);
         }
+        int i;
         // Fill a bit harder to ensure RAM gets allocated
-        for (int i = 0; i < (1024*1024) / sizeof(uint64_t); i++) {
+        for (i = 0; i < (1024*1024) / sizeof(uint64_t); i++) {
             temp[i] = i;
         }
     }
