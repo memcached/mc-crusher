@@ -53,6 +53,8 @@
 
 #define SHARED_RBUF_SIZE 1024 * 64
 #define SHARED_VALUE_SIZE 1024 * 1024
+// Big enough for conf/set_big_values and below valgrind max-stackframe
+#define WBUF_SIZE 1024 * 1024
 // avoiding some hacks for finding member size.
 #define SOCK_MAX 100
 
@@ -152,7 +154,7 @@ struct connection {
     int (*ascii_format)(struct connection *c);
     int (*bin_format)(struct connection *c);
     int (*bin_prep_cmd)(struct connection *c);
-    unsigned char wbuf[65536]; // putting this at the end to get more of the above into fewer cachelines.
+    unsigned char wbuf[WBUF_SIZE]; // putting this at the end to get more of the above into fewer cachelines.
 };
 
 static void client_handler(const int fd, const short which, void *arg);
@@ -915,6 +917,13 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
             break;
         case VALUE_SIZE:
             template.value_size = atoi(value);
+            if(template.value_size > WBUF_SIZE){
+                fprintf(stderr, "Error, value_size (%i) too large, WBUF_SIZE is %i\n", template.value_size, WBUF_SIZE);
+                exit(-1);
+            }
+            if( (template.value_size + 1024) > WBUF_SIZE){ // allow 1024 bytes for command, key and metadata
+                fprintf(stderr, "Warning, value_size (%i + 1024) may be too large, WBUF_SIZE is %i\n", template.value_size, WBUF_SIZE);
+            }
             break;
         case VALUE:
             strcpy(template.s->value, value);
