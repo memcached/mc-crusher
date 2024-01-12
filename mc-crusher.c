@@ -53,6 +53,7 @@
 
 #define SHARED_RBUF_SIZE 1024 * 64
 #define SHARED_VALUE_SIZE 1024 * 1024
+#define MIN_WBUF_SIZE 65536
 // avoiding some hacks for finding member size.
 #define SOCK_MAX 100
 
@@ -152,7 +153,7 @@ struct connection {
     int (*ascii_format)(struct connection *c);
     int (*bin_format)(struct connection *c);
     int (*bin_prep_cmd)(struct connection *c);
-    unsigned char wbuf[65536]; // putting this at the end to get more of the above into fewer cachelines.
+    unsigned char *wbuf;
 };
 
 static void client_handler(const int fd, const short which, void *arg);
@@ -544,7 +545,7 @@ static inline void run_write(struct connection *c) {
     }
     {
         // not using iovecs, save some libc/kernel looping.
-        c->wbuf_towrite = c->wbuf_pos - (unsigned char *)&c->wbuf;
+        c->wbuf_towrite = c->wbuf_pos - c->wbuf;
         c->wbuf_written = 0;
         //fprintf(stderr, "WBUF towrite: %d\n", c->wbuf_towrite);
         write_flat(c, c->next_state);
@@ -1039,6 +1040,13 @@ static void start_template(struct connection *template, int conns_tomake, bool u
     // TODO: randomize run counter if conn_rand_off.
     *template->cur_key = 0;
     *template->write_count = 0;
+
+    size_t wbuf_size = template->value_size + 1024; // space for op, key and metadata
+    if( wbuf_size < MIN_WBUF_SIZE ){
+        wbuf_size = MIN_WBUF_SIZE;
+    }
+    template->wbuf = (unsigned char*)malloc(wbuf_size);
+    memset(template->wbuf, 0, wbuf_size);
 
     int i, newsock;
     for (i = 0; i < conns_tomake; i++) {
