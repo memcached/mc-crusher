@@ -53,8 +53,7 @@
 
 #define SHARED_RBUF_SIZE 1024 * 64
 #define SHARED_VALUE_SIZE 1024 * 1024
-// Big enough for conf/set_big_values and below valgrind max-stackframe
-#define WBUF_SIZE 1024 * 1024
+#define MIN_WBUF_SIZE 65536
 // avoiding some hacks for finding member size.
 #define SOCK_MAX 100
 
@@ -154,7 +153,7 @@ struct connection {
     int (*ascii_format)(struct connection *c);
     int (*bin_format)(struct connection *c);
     int (*bin_prep_cmd)(struct connection *c);
-    unsigned char wbuf[WBUF_SIZE]; // putting this at the end to get more of the above into fewer cachelines.
+    unsigned char *wbuf;
 };
 
 static void client_handler(const int fd, const short which, void *arg);
@@ -546,7 +545,7 @@ static inline void run_write(struct connection *c) {
     }
     {
         // not using iovecs, save some libc/kernel looping.
-        c->wbuf_towrite = c->wbuf_pos - (unsigned char *)&c->wbuf;
+        c->wbuf_towrite = c->wbuf_pos - c->wbuf;
         c->wbuf_written = 0;
         //fprintf(stderr, "WBUF towrite: %d\n", c->wbuf_towrite);
         write_flat(c, c->next_state);
@@ -917,13 +916,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
             break;
         case VALUE_SIZE:
             template.value_size = atoi(value);
-            if(template.value_size > WBUF_SIZE){
-                fprintf(stderr, "Error, value_size (%i) too large, WBUF_SIZE is %i\n", template.value_size, WBUF_SIZE);
-                exit(-1);
-            }
-            if( (template.value_size + 1024) > WBUF_SIZE){ // allow 1024 bytes for command, key and metadata
-                fprintf(stderr, "Warning, value_size (%i + 1024) may be too large, WBUF_SIZE is %i\n", template.value_size, WBUF_SIZE);
-            }
             break;
         case VALUE:
             strcpy(template.s->value, value);
@@ -1048,6 +1040,13 @@ static void start_template(struct connection *template, int conns_tomake, bool u
     // TODO: randomize run counter if conn_rand_off.
     *template->cur_key = 0;
     *template->write_count = 0;
+
+    size_t wbuf_size = template->value_size + 1024; // space for op, key and metadata
+    if( wbuf_size < MIN_WBUF_SIZE ){
+        wbuf_size = MIN_WBUF_SIZE;
+    }
+    template->wbuf = (unsigned char*)malloc(wbuf_size);
+    memset(template->wbuf, 0, wbuf_size);
 
     int i, newsock;
     for (i = 0; i < conns_tomake; i++) {
